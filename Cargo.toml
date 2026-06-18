@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "DevCred - A local credential manager for developers with a TUI interface"
 license = "MIT"
-repository = "https://github.com/devcred/devcred"
+repository = "https://github.com/RestRegular/DevCred"
 
 [[bin]]
 name = "devcred"
