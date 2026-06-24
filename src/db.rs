@@ -8,7 +8,7 @@
 
 use crate::credential::CredentialKind;
 use crate::crypto::{self, MasterKey, SALT_LEN};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params, params_from_iter};
 use rusqlite::types::Value;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,21 @@ const SCHEMA_VERSION: u32 = 1;
 /// password-verification probe. On open we try to decrypt it; failure means
 /// the master password is wrong.
 const PROBE_PLAINTEXT: &[u8] = b"devcred-probe-v1";
+
+/// Permission level granted by the credential used to open the vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    /// Full access — the master password was used.
+    Full,
+    /// Read-only access — a basic token was used. No add/edit/delete/reveal.
+    Basic,
+}
+
+impl Permission {
+    pub fn is_full(self) -> bool {
+        matches!(self, Permission::Full)
+    }
+}
 
 /// A credential row as stored in the database (secret still encrypted).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,11 +85,25 @@ pub struct CustomField {
 pub struct Vault {
     conn: Connection,
     key: MasterKey,
+    permission: Permission,
+}
+
+/// Metadata about a stored access token (for listing/revocation).
+#[derive(Debug)]
+pub struct TokenInfo {
+    pub id: i64,
+    pub token_id: String,
+    pub label: String,
+    pub created_at: i64,
 }
 
 impl Vault {
     /// Open (or create) the vault at `path`, deriving the key from `password`.
-    /// If the database is new, a fresh salt is generated and stored.
+    ///
+    /// The `password` may be the master password (full access) or a previously
+    /// generated basic token (read-only access). Token lookup is O(1) via a
+    /// SHA-256 hash; only if no token matches do we run the expensive Argon2id
+    /// master-password derivation.
     pub fn open(path: &Path, password: &str) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("opening vault at {}", path.display()))?;
@@ -107,6 +136,15 @@ impl Vault {
                  value_blob    BLOB NOT NULL,
                  masked        INTEGER NOT NULL DEFAULT 0,
                  position      INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS tokens (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 token_id    TEXT NOT NULL UNIQUE,
+                 salt        BLOB NOT NULL,
+                 wrapped_key BLOB NOT NULL,
+                 permission  TEXT NOT NULL DEFAULT 'basic',
+                 label       TEXT NOT NULL DEFAULT '',
+                 created_at  INTEGER NOT NULL
              );",
         )
         .context("initializing schema")?;
@@ -119,6 +157,7 @@ impl Vault {
             ) {
             Ok(s) => s,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // New vault — must be the master password.
                 let s = crypto::new_salt();
                 conn.execute(
                     "INSERT INTO meta (key, value) VALUES ('salt', ?1)",
@@ -136,12 +175,47 @@ impl Vault {
             return Err(anyhow::anyhow!("stored salt is corrupt"));
         }
 
+        // --- Token authentication (fast path) ---
+        // Hash the input and look up the tokens table. If found, derive the
+        // token key, unwrap the master key, and verify via the probe.
+        let tid = crypto::token_id(password);
+        let token_row: Option<(Vec<u8>, Vec<u8>)> = conn
+            .query_row(
+                "SELECT salt, wrapped_key FROM tokens WHERE token_id = ?1",
+                params![&tid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+
+        if let Some((token_salt, wrapped)) = token_row {
+            let token_key =
+                MasterKey::derive(password, &token_salt).context("deriving token key")?;
+            let master_bytes = token_key
+                .open(&wrapped)
+                .context("token authentication failed (corrupt wrapped key)")?;
+            let key = MasterKey::from_bytes(&master_bytes)?;
+            // Verify the unwrapped key against the probe.
+            let probe: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'probe'",
+                    [],
+                    |r: &rusqlite::Row<'_>| r.get::<_, Vec<u8>>(0),
+                )
+                .ok();
+            if let Some(blob) = &probe {
+                key.open(blob).context("token verification failed")?;
+            }
+            return Ok(Vault {
+                conn,
+                key,
+                permission: Permission::Basic,
+            });
+        }
+
+        // --- Master password authentication (slow path) ---
         let key = MasterKey::derive(password, &salt).context("deriving master key")?;
 
         // Verify the master password using an encrypted probe stored in meta.
-        // New vaults get a probe created; existing vaults must decrypt it.
-        // For vaults predating the probe (no `probe` row), fall back to
-        // decrypting an existing credential's secret, then store a probe.
         let probe: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'probe'",
@@ -181,7 +255,11 @@ impl Vault {
             }
         }
 
-        Ok(Vault { conn, key })
+        Ok(Vault {
+            conn,
+            key,
+            permission: Permission::Full,
+        })
     }
 
     /// Insert a new credential. Returns its row id.
@@ -195,6 +273,9 @@ impl Vault {
         env_var: &str,
         notes: &str,
     ) -> Result<i64> {
+        if !self.permission.is_full() {
+            bail!("permission denied: adding credentials requires the master password");
+        }
         let blob = self.key.seal(secret.as_bytes())?;
         let now = now_ts();
         self.conn.execute(
@@ -227,6 +308,9 @@ impl Vault {
         notes: Option<&str>,
         kind: Option<CredentialKind>,
     ) -> Result<()> {
+        if !self.permission.is_full() {
+            bail!("permission denied: updating credentials requires the master password");
+        }
         let now = now_ts();
         let mut sets: Vec<&str> = Vec::new();
         let mut binds: Vec<Value> = Vec::new();
@@ -275,6 +359,9 @@ impl Vault {
 
     /// Delete a credential by id.
     pub fn delete(&self, id: i64) -> Result<bool> {
+        if !self.permission.is_full() {
+            bail!("permission denied: deleting credentials requires the master password");
+        }
         let n = self.conn.execute("DELETE FROM credentials WHERE id = ?1", params![id])?;
         Ok(n > 0)
     }
@@ -427,9 +514,153 @@ impl Vault {
         }
     }
 
+    /// Returns the permission level of the current session.
+    pub fn permission(&self) -> Permission {
+        self.permission
+    }
+
+    /// Change the master password: re-derive a key from `new_password` with a
+    /// fresh salt, re-encrypt every secret and custom-field value, and update
+    /// the stored salt + probe. Tokens are invalidated (their wrapped keys
+    /// were encrypted with the old master key).
+    pub fn change_password(&mut self, new_password: &str) -> Result<()> {
+        if !self.permission.is_full() {
+            bail!("permission denied: changing the master password requires the master password");
+        }
+
+        // 1. Load all credential records (id + secret_blob).
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, secret_blob FROM credentials")?;
+        let cred_rows: Vec<(i64, Vec<u8>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .map(|r| r.unwrap())
+            .collect();
+        drop(stmt);
+
+        // 2. Load all custom-field rows (id, value_blob).
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, value_blob FROM custom_fields")?;
+        let cf_rows: Vec<(i64, Vec<u8>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .map(|r| r.unwrap())
+            .collect();
+        drop(stmt);
+
+        // 3. Derive the new key.
+        let new_salt = crypto::new_salt();
+        let new_key = MasterKey::derive(new_password, &new_salt)
+            .context("deriving new master key")?;
+
+        // 4. Re-encrypt every secret with the new key.
+        let tx = self.conn.transaction()?;
+        for (id, blob) in &cred_rows {
+            let plaintext = self.key.open(blob)?;
+            let new_blob = new_key.seal(&plaintext)?;
+            tx.execute(
+                "UPDATE credentials SET secret_blob = ?1 WHERE id = ?2",
+                params![new_blob, id],
+            )?;
+        }
+        for (id, blob) in &cf_rows {
+            let plaintext = self.key.open(blob)?;
+            let new_blob = new_key.seal(&plaintext)?;
+            tx.execute(
+                "UPDATE custom_fields SET value_blob = ?1 WHERE id = ?2",
+                params![new_blob, id],
+            )?;
+        }
+
+        // 5. Update salt and probe.
+        tx.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'salt'",
+            params![new_salt.as_slice()],
+        )?;
+        let probe_blob = new_key.seal(PROBE_PLAINTEXT)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('probe', ?1)",
+            params![probe_blob.as_slice()],
+        )?;
+
+        // 6. Invalidate all tokens (wrapped keys are useless with the new master key).
+        tx.execute("DELETE FROM tokens", [])?;
+
+        tx.commit()?;
+
+        // Force a WAL checkpoint so changes are persisted to the main db file.
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+
+        // 7. Update the in-memory key.
+        self.key = new_key;
+
+        Ok(())
+    }
+
+    /// Create a new access token with the given label.
+    ///
+    /// The token is a random string (`dc_` + base64url). The master key is
+    /// encrypted with a key derived from the token and stored in the `tokens`
+    /// table. All tokens have basic (read-only) permission.
+    /// Returns the plaintext token string (shown only once).
+    pub fn create_token(&self, label: &str) -> Result<String> {
+        if !self.permission.is_full() {
+            bail!("permission denied: creating tokens requires the master password");
+        }
+        let (token, tid) = crypto::generate_token();
+        let token_salt = crypto::new_salt();
+        let token_key = MasterKey::derive(&token, &token_salt)?;
+        // Serialize the master key bytes and encrypt with the token key.
+        let master_bytes = self.key.as_bytes();
+        let wrapped = token_key.seal(master_bytes)?;
+        let now = now_ts();
+        self.conn.execute(
+            "INSERT INTO tokens (token_id, salt, wrapped_key, permission, label, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![&tid, token_salt.as_slice(), wrapped.as_slice(), "basic", label, now],
+        )?;
+        Ok(token)
+    }
+
+    /// List all stored tokens (without revealing the token strings).
+    pub fn list_tokens(&self) -> Result<Vec<TokenInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, token_id, label, created_at FROM tokens ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TokenInfo {
+                id: r.get(0)?,
+                token_id: r.get(1)?,
+                label: r.get(2)?,
+                created_at: r.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Revoke a token by its database id or label.
+    pub fn revoke_token(&self, query: &str) -> Result<bool> {
+        if !self.permission.is_full() {
+            bail!("permission denied: revoking tokens requires the master password");
+        }
+        let deleted = if let Ok(id) = query.parse::<i64>() {
+            self.conn.execute("DELETE FROM tokens WHERE id = ?1", params![id])?
+        } else {
+            self.conn.execute("DELETE FROM tokens WHERE label = ?1", params![query])?
+        };
+        Ok(deleted > 0)
+    }
+
     /// Replace all custom fields for a credential (delete + reinsert).
     /// Each tuple is `(key, value, masked)`.
     pub fn set_custom_fields(&self, credential_id: i64, fields: &[(String, String, bool)]) -> Result<()> {
+        if !self.permission.is_full() {
+            bail!("permission denied: modifying custom fields requires the master password");
+        }
         self.conn.execute(
             "DELETE FROM custom_fields WHERE credential_id = ?1",
             params![credential_id],
@@ -466,6 +697,20 @@ impl Vault {
             let pt = self.key.open(&blob)?;
             let value = String::from_utf8(pt).unwrap_or_default();
             out.push(CustomField { key, value, masked });
+        }
+        Ok(out)
+    }
+
+    /// Load custom field keys (plaintext) for a credential, without decrypting values.
+    /// Used for fuzzy search indexing where only the key matters.
+    pub fn custom_field_keys(&self, credential_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT field_key FROM custom_fields WHERE credential_id = ?1 ORDER BY position ASC",
+        )?;
+        let rows = stmt.query_map(params![credential_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
         }
         Ok(out)
     }
@@ -662,6 +907,42 @@ mod tests {
         // Correct password works.
         let rec = vault.get(id).unwrap().unwrap();
         assert_eq!(vault.decrypt(&rec).unwrap().secret, "my-secret-value");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn change_password_works() {
+        let path = tmp_vault();
+        let mut vault = Vault::open(&path, "old-pass").unwrap();
+        let id = vault
+            .add(
+                "test-cred",
+                CredentialKind::Generic,
+                "prod",
+                "app",
+                "secret-value-123",
+                "API_KEY",
+                "note",
+            )
+            .unwrap();
+
+        // Change password.
+        vault.change_password("new-pass").unwrap();
+
+        // In-memory vault can still decrypt with the updated key.
+        let rec = vault.get(id).unwrap().unwrap();
+        let dec = vault.decrypt(&rec).unwrap();
+        assert_eq!(dec.secret, "secret-value-123");
+
+        // Reopen with old password — should fail.
+        assert!(Vault::open(&path, "old-pass").is_err());
+
+        // Reopen with new password — should succeed and decrypt correctly.
+        let vault2 = Vault::open(&path, "new-pass").unwrap();
+        let rec2 = vault2.get(id).unwrap().unwrap();
+        let dec2 = vault2.decrypt(&rec2).unwrap();
+        assert_eq!(dec2.secret, "secret-value-123");
 
         std::fs::remove_file(&path).ok();
     }

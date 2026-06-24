@@ -8,6 +8,8 @@ use crate::db::{self, Vault};
 use crate::{clipboard, injector};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 use std::path::PathBuf;
 
 /// DevCred — local, encrypted credential manager for developers.
@@ -62,6 +64,10 @@ pub enum Command {
         fields: Vec<String>,
     },
     /// List credentials (names only; secrets stay hidden).
+    ///
+    /// Use --query for fuzzy search across name, project, env, and custom fields.
+    /// Prefix syntax: "env:staging", "pro:web-app", "cf:api-key".
+    /// Without a prefix, the query searches all fields.
     List {
         /// Filter by environment.
         #[arg(long)]
@@ -69,6 +75,10 @@ pub enum Command {
         /// Filter by project.
         #[arg(long)]
         project: Option<String>,
+        /// Fuzzy search query. Supports prefixes: env:, pro:, cf:.
+        /// Without prefix, searches across all fields.
+        #[arg(short, long)]
+        query: Option<String>,
         /// Show the decrypted secret alongside each row (dangerous).
         #[arg(long)]
         reveal: bool,
@@ -82,9 +92,21 @@ pub enum Command {
         clear_after: u64,
     },
     /// Print a credential's secret to stdout (pipe-friendly; use with care).
+    ///
+    /// The query supports fuzzy search across name, project, env, and custom fields.
+    /// Prefix syntax: "env:staging", "pro:web-app", "cf:api-key".
+    /// Without a prefix, the query searches all fields.
+    /// If multiple credentials match, the best match is shown.
+    ///
+    /// Use --full to print all fields (name, kind, env, project, env_var,
+    /// secret, notes, custom fields, timestamps) in a readable format.
     Show {
-        /// Credential name or id.
+        /// Credential name, id, or fuzzy query. Supports prefixes: env:, pro:, cf:.
+        /// Without prefix, searches across all fields.
         query: String,
+        /// Show all credential fields, not just the secret.
+        #[arg(long)]
+        full: bool,
     },
     /// Remove a credential.
     Rm {
@@ -104,12 +126,42 @@ pub enum Command {
         /// Only inject credentials matching these names/env-vars (comma-separated).
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
+        /// Disable secret redaction in the child process's stdout/stderr.
+        /// By default, injected secret values are replaced with [REDACTED].
+        #[arg(long = "no-redact")]
+        no_redact: bool,
         /// Command and args after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Manage access tokens for restricted (basic) permission.
+    ///
+    /// A basic token allows read-only operations (list, copy, inject, show
+    /// non-masked fields) but blocks editing, adding, deleting, and revealing
+    /// masked fields. Useful for giving an AI agent limited vault access.
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
     /// Launch the TUI (default when no subcommand is given).
     Tui,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TokenAction {
+    /// Create a new access token. Requires the master password.
+    Create {
+        /// Human-readable label for this token (e.g. "agent-readonly").
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List all stored tokens (token strings are not shown).
+    List,
+    /// Revoke a token by id or label. Requires the master password.
+    Revoke {
+        /// Token id (numeric) or label.
+        query: String,
+    },
 }
 
 /// Entry point dispatched from `main`.
@@ -121,7 +173,7 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         None | Some(Command::Tui) => {
             let vault = open_vault(&vault_path)?;
-            crate::tui::run(vault).context("TUI session")?;
+            crate::tui::run(vault, vault_path).context("TUI session")?;
             Ok(())
         }
         Some(Command::Init) => init_vault(&vault_path),
@@ -138,21 +190,23 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Command::List {
             env,
             project,
+            query,
             reveal,
-        }) => list_credentials(&vault_path, env, project, reveal),
+        }) => list_credentials(&vault_path, env, project, query, reveal),
         Some(Command::Copy {
             query,
             clear_after,
         }) => copy_credential(&vault_path, &query, clear_after),
-        Some(Command::Show { query }) => show_credential(&vault_path, &query),
+        Some(Command::Show { query, full }) => show_credential(&vault_path, &query, full),
         Some(Command::Rm { query, yes }) => remove_credential(&vault_path, &query, yes),
-        Some(Command::Inject { env, only, args }) => {
+        Some(Command::Token { action }) => handle_token(&vault_path, action),
+        Some(Command::Inject { env, only, no_redact, args }) => {
             let vault = open_vault(&vault_path)?;
             if args.is_empty() {
                 bail!("`inject` requires a command after `--`, e.g. `devcred inject -- npm publish`");
             }
             let (cmd, rest) = args.split_first().expect("non-empty");
-            let code = injector::run(&vault, env.as_deref(), &only, cmd, rest)?;
+            let code = injector::run(&vault, env.as_deref(), &only, cmd, rest, !no_redact)?;
             std::process::exit(code);
         }
     }
@@ -341,10 +395,14 @@ fn list_credentials(
     path: &PathBuf,
     env: Option<String>,
     project: Option<String>,
+    query: Option<String>,
     reveal: bool,
 ) -> Result<()> {
     let vault = open_vault(path)?;
     if reveal {
+        if !vault.permission().is_full() {
+            bail!("permission denied: --reveal requires the master password");
+        }
         // Re-confirm master password before dumping plaintext secrets.
         eprintln!("WARNING: revealing secrets in plaintext.");
         let confirm = rpassword::prompt_password("Re-enter master password to confirm: ")?;
@@ -353,6 +411,11 @@ fn list_credentials(
         }
     }
     let records = vault.list(env.as_deref(), project.as_deref())?;
+    let records = if let Some(q) = query {
+        fuzzy_filter(&vault, &records, &q)?
+    } else {
+        records
+    };
     if records.is_empty() {
         println!("(no credentials)");
         return Ok(());
@@ -394,24 +457,80 @@ fn copy_credential(path: &PathBuf, query: &str, clear_after: u64) -> Result<()> 
     Ok(())
 }
 
-fn show_credential(path: &PathBuf, query: &str) -> Result<()> {
+fn show_credential(path: &PathBuf, query: &str, full: bool) -> Result<()> {
     let vault = open_vault(path)?;
-    let rec = lookup(&vault, query)?.context("no matching credential")?;
-    let dec = vault.decrypt(&rec)?;
-    // Secret goes to stdout (pipe-friendly); custom fields go to stderr.
-    if !dec.custom_fields.is_empty() {
-        eprintln!("Custom fields for `{}`:", dec.name);
-        for cf in &dec.custom_fields {
-            let val = if cf.masked {
-                "•".repeat(cf.value.chars().count().min(16))
+    // Try exact lookup first (by id or name), then fall back to fuzzy search.
+    let rec = match lookup(&vault, query)? {
+        Some(r) => r,
+        None => {
+            let matches = fuzzy_filter(&vault, &vault.list(None, None)?, query)?;
+            if let Some(best) = matches.into_iter().next() {
+                best
             } else {
-                cf.value.clone()
-            };
-            eprintln!("  {}: {}{}", cf.key, val, if cf.masked { " (masked)" } else { "" });
+                bail!("no matching credential for `{}`", query);
+            }
+        }
+    };
+    let dec = vault.decrypt(&rec)?;
+    let is_full = vault.permission().is_full();
+
+    if full && !is_full {
+        bail!("permission denied: --full requires the master password");
+    }
+
+    if !full {
+        // Pipe-friendly mode: secret to stdout, custom fields to stderr.
+        // In basic mode, masked custom fields are omitted entirely.
+        if !dec.custom_fields.is_empty() {
+            eprintln!("Custom fields for `{}`:", dec.name);
+            for cf in &dec.custom_fields {
+                if cf.masked && !is_full {
+                    continue; // Hide masked fields in basic mode.
+                }
+                let val = if cf.masked {
+                    "•".repeat(cf.value.chars().count().min(16))
+                } else {
+                    cf.value.clone()
+                };
+                eprintln!("  {}: {}{}", cf.key, val, if cf.masked { " (masked)" } else { "" });
+            }
+        }
+        print!("{}", dec.secret);
+        return Ok(());
+    }
+
+    // Full mode: print all fields in a readable format to stdout.
+    println!("ID:          {}", dec.id);
+    println!("Name:        {}", dec.name);
+    println!("Kind:        {}", dec.kind.label());
+    println!("Environment: {}", if dec.environment.is_empty() { "(none)" } else { &dec.environment });
+    println!("Project:     {}", if dec.project.is_empty() { "(none)" } else { &dec.project });
+    println!("Env Var:     {}", dec.env_var);
+    println!("Secret:      {}", dec.secret);
+    if !dec.notes.is_empty() {
+        println!("Notes:       {}", dec.notes);
+    }
+    if !dec.custom_fields.is_empty() {
+        println!();
+        println!("Custom Fields:");
+        for cf in &dec.custom_fields {
+            let masked_tag = if cf.masked { " (masked)" } else { "" };
+            println!("  {:<16}: {}{}", cf.key, cf.value, masked_tag);
         }
     }
-    print!("{}", dec.secret);
+    println!();
+    println!("Created:     {}", fmt_ts_cli(dec.created_at));
+    println!("Updated:     {}", fmt_ts_cli(dec.updated_at));
     Ok(())
+}
+
+/// Format a Unix timestamp as a human-readable UTC string.
+fn fmt_ts_cli(ts: i64) -> String {
+    use chrono::DateTime;
+    match DateTime::from_timestamp(ts, 0) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M UTC").to_string(),
+        None => ts.to_string(),
+    }
 }
 
 fn remove_credential(path: &PathBuf, query: &str, yes: bool) -> Result<()> {
@@ -434,6 +553,153 @@ fn remove_credential(path: &PathBuf, query: &str, yes: bool) -> Result<()> {
         bail!("nothing deleted");
     }
     Ok(())
+}
+
+/// Handle `devcred token` subcommands.
+fn handle_token(path: &PathBuf, action: TokenAction) -> Result<()> {
+    let vault = open_vault(path)?;
+    match action {
+        TokenAction::Create { label } => {
+            if !vault.permission().is_full() {
+                bail!("permission denied: creating tokens requires the master password");
+            }
+            let label = label.unwrap_or_else(|| {
+                let count = vault.list_tokens().map(|t| t.len()).unwrap_or(0);
+                format!("token-{}", count + 1)
+            });
+            let token = vault.create_token(&label)?;
+            // Copy to clipboard with auto-clear.
+            match crate::clipboard::copy_and_clear_after(&token, 60) {
+                Ok(_) => {
+                    println!("Token (label: {}) copied to clipboard.", label);
+                    eprintln!("Clipboard will auto-clear in 60 seconds.");
+                    eprintln!("Use it as the DEVCRED_PASSWORD for read-only access.");
+                }
+                Err(_) => {
+                    // Clipboard failed — fall back to printing.
+                    println!("Token (label: {}):", label);
+                    println!();
+                    println!("  {}", token);
+                    println!();
+                    eprintln!("WARNING: clipboard unavailable — token printed to stdout.");
+                    eprintln!("Store this token securely — it will not be shown again.");
+                }
+            }
+        }
+        TokenAction::List => {
+            let tokens = vault.list_tokens()?;
+            if tokens.is_empty() {
+                println!("(no tokens)");
+                return Ok(());
+            }
+            println!(
+                "{:<4} {:<16} {:<20} {}",
+                "ID", "LABEL", "TOKEN_ID", "CREATED"
+            );
+            for t in &tokens {
+                println!(
+                    "{:<4} {:<16} {:<20} {}",
+                    t.id,
+                    truncate(&t.label, 16),
+                    &t.token_id[..8.min(t.token_id.len())],
+                    fmt_ts_cli(t.created_at),
+                );
+            }
+        }
+        TokenAction::Revoke { query } => {
+            if vault.revoke_token(&query)? {
+                println!("Token `{}` revoked.", query);
+            } else {
+                bail!("no token matching `{}`", query);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parsed query with optional field prefix.
+enum QueryScope {
+    /// Search across all fields (name, project, env, kind, env_var, custom field keys).
+    All,
+    /// Search only in the environment field.
+    Env,
+    /// Search only in the project field.
+    Project,
+    /// Search only in custom field keys.
+    CustomField,
+}
+
+/// Parse a query string, detecting prefixes like "env:", "pro:", "cf:".
+fn parse_query(query: &str) -> (QueryScope, &str) {
+    let lower = query.to_lowercase();
+    if lower.starts_with("env:") {
+        (QueryScope::Env, &query[4..])
+    } else if lower.starts_with("pro:") {
+        (QueryScope::Project, &query[4..])
+    } else if lower.starts_with("cf:") {
+        (QueryScope::CustomField, &query[3..])
+    } else {
+        (QueryScope::All, query)
+    }
+}
+
+/// Filter credential records using fuzzy matching with optional field-scoped queries.
+/// Returns records sorted by match score (best first), then by name alphabetically.
+fn fuzzy_filter(
+    vault: &Vault,
+    records: &[db::CredentialRecord],
+    query: &str,
+) -> Result<Vec<db::CredentialRecord>> {
+    let (scope, term) = parse_query(query);
+    if term.trim().is_empty() {
+        return Ok(records.to_vec());
+    }
+    let matcher = SkimMatcherV2::default();
+    let term_lower = term.trim().to_lowercase();
+
+    // Pre-load custom field keys for each record.
+    let cf_keys: std::collections::HashMap<i64, String> = records
+        .iter()
+        .filter_map(|r| {
+            let keys = vault.custom_field_keys(r.id).unwrap_or_default();
+            if keys.is_empty() {
+                None
+            } else {
+                Some((r.id, keys.join(" ").to_lowercase()))
+            }
+        })
+        .collect();
+
+    let mut scored: Vec<(i64, db::CredentialRecord)> = records
+        .iter()
+        .filter_map(|r| {
+            let hay = match scope {
+                QueryScope::All => {
+                    let mut h = format!(
+                        "{} {} {} {} {}",
+                        r.name, r.kind, r.environment, r.project, r.env_var
+                    )
+                    .to_lowercase();
+                    if let Some(cf) = cf_keys.get(&r.id) {
+                        h.push(' ');
+                        h.push_str(cf);
+                    }
+                    h
+                }
+                QueryScope::Env => r.environment.to_lowercase(),
+                QueryScope::Project => r.project.to_lowercase(),
+                QueryScope::CustomField => cf_keys.get(&r.id).cloned().unwrap_or_default(),
+            };
+            matcher.fuzzy_match(&hay, &term_lower).map(|score| (score, r.clone()))
+        })
+        .collect();
+
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+    });
+
+    Ok(scored.into_iter().map(|(_, r)| r).collect())
 }
 
 /// Look up a credential by id (numeric) or name (case-insensitive).

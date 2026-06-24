@@ -11,7 +11,9 @@ use aes_gcm::{
 };
 use anyhow::{Result, anyhow};
 use argon2::{Algorithm, Argon2, Params, Version};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 /// 96-bit GCM nonce length in bytes.
@@ -42,6 +44,22 @@ impl MasterKey {
             .hash_password_into(password.as_bytes(), salt, &mut key)
             .map_err(|e| anyhow!("argon2 derive failed: {e}"))?;
         Ok(MasterKey(key))
+    }
+
+    /// Reconstruct a key from raw bytes (used when unwrapping a token's
+    /// encrypted master key).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != KEY_LEN {
+            return Err(anyhow!("key bytes length mismatch"));
+        }
+        let mut key = [0u8; KEY_LEN];
+        key.copy_from_slice(bytes);
+        Ok(MasterKey(key))
+    }
+
+    /// Return the raw key bytes (for key wrapping during token creation).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 
     /// Encrypt a plaintext secret. Returns `nonce || ciphertext`.
@@ -78,6 +96,30 @@ pub fn new_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];
     rand::thread_rng().fill_bytes(&mut salt);
     salt
+}
+
+/// Token entropy length in bytes (192 bits).
+pub const TOKEN_LEN: usize = 24;
+
+/// Generate a random access token.
+///
+/// Returns `(token_string, token_id_hex)` where:
+/// - `token_string` is `dc_` + base64url(random 24 bytes) — shown to the user once.
+/// - `token_id_hex` is the first 16 hex chars of SHA-256(token_string) — used as
+///   a lookup key in the `tokens` table. 64 bits is enough to avoid collisions
+///   for any realistic number of tokens.
+pub fn generate_token() -> (String, String) {
+    let mut bytes = [0u8; TOKEN_LEN];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token = format!("dc_{}", URL_SAFE_NO_PAD.encode(bytes));
+    let id = token_id(&token);
+    (token, id)
+}
+
+/// Compute the lookup id (first 16 hex chars of SHA-256) for a token string.
+pub fn token_id(token: &str) -> String {
+    let hash = Sha256::digest(token.as_bytes());
+    hex::encode(&hash[..8])
 }
 
 #[cfg(test)]

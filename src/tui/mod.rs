@@ -31,10 +31,11 @@ use fuzzy_matcher::FuzzyMatcher;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Run the TUI until the user quits. Restores the terminal on exit.
-pub fn run(vault: Vault) -> Result<()> {
+pub fn run(vault: Vault, vault_path: PathBuf) -> Result<()> {
     enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("entering alternate screen")?;
@@ -42,7 +43,7 @@ pub fn run(vault: Vault) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("creating terminal")?;
     terminal.clear().ok();
 
-    let mut app = App::new(vault);
+    let mut app = App::new(vault, vault_path);
     let result = app_loop(&mut terminal, &mut app);
 
     // Restore terminal regardless of outcome.
@@ -236,6 +237,15 @@ pub enum Mode {
     ConfirmDelete,
     RevealPrompt,
     Help,
+    Settings,
+}
+
+/// Which settings tab is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    Password,
+    Tokens,
+    Info,
 }
 
 /// Which pane has keyboard focus in the main list view.
@@ -282,6 +292,8 @@ pub struct Form {
     pub editing_id: Option<i64>,
     /// User-defined custom fields.
     pub custom_fields: Vec<CustomFieldForm>,
+    /// Cursor position (char index) within the currently-focused text field.
+    pub cursor: usize,
 }
 
 impl Form {
@@ -341,6 +353,116 @@ impl Form {
             self.env_var = self.kind.env_var().to_string();
         }
     }
+
+    /// Set cursor to the end of the current field's text.
+    fn sync_cursor_to_end(&mut self) {
+        self.cursor = self
+            .current_field_mut()
+            .map(|f| f.chars().count())
+            .unwrap_or(0);
+    }
+
+    /// Insert a character at the cursor position.
+    fn insert_char(&mut self, c: char) {
+        match self.field {
+            FormField::Name => text_insert(&mut self.name, &mut self.cursor, c),
+            FormField::Secret => text_insert(&mut self.secret, &mut self.cursor, c),
+            FormField::Kind => {}
+            FormField::Env => text_insert(&mut self.env, &mut self.cursor, c),
+            FormField::Project => text_insert(&mut self.project, &mut self.cursor, c),
+            FormField::EnvVar => text_insert(&mut self.env_var, &mut self.cursor, c),
+            FormField::Notes => text_insert(&mut self.notes, &mut self.cursor, c),
+            FormField::CustomKey(i) => {
+                if let Some(f) = self.custom_fields.get_mut(i) {
+                    text_insert(&mut f.key, &mut self.cursor, c);
+                }
+            }
+            FormField::CustomValue(i) => {
+                if let Some(f) = self.custom_fields.get_mut(i) {
+                    text_insert(&mut f.value, &mut self.cursor, c);
+                }
+            }
+            FormField::CustomMasked(_) | FormField::AddField => {}
+        }
+    }
+
+    /// Delete the character before the cursor.
+    fn delete_before_cursor(&mut self) {
+        match self.field {
+            FormField::Name => text_delete_before(&mut self.name, &mut self.cursor),
+            FormField::Secret => text_delete_before(&mut self.secret, &mut self.cursor),
+            FormField::Kind => {}
+            FormField::Env => text_delete_before(&mut self.env, &mut self.cursor),
+            FormField::Project => text_delete_before(&mut self.project, &mut self.cursor),
+            FormField::EnvVar => text_delete_before(&mut self.env_var, &mut self.cursor),
+            FormField::Notes => text_delete_before(&mut self.notes, &mut self.cursor),
+            FormField::CustomKey(i) => {
+                if let Some(f) = self.custom_fields.get_mut(i) {
+                    text_delete_before(&mut f.key, &mut self.cursor);
+                }
+            }
+            FormField::CustomValue(i) => {
+                if let Some(f) = self.custom_fields.get_mut(i) {
+                    text_delete_before(&mut f.value, &mut self.cursor);
+                }
+            }
+            FormField::CustomMasked(_) | FormField::AddField => {}
+        }
+    }
+
+    /// Move cursor left by one char (clamped at 0).
+    fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    /// Move cursor right by one char (clamped at text end).
+    fn cursor_right(&mut self) {
+        let max = match self.field {
+            FormField::Name => self.name.chars().count(),
+            FormField::Secret => self.secret.chars().count(),
+            FormField::Kind => 0,
+            FormField::Env => self.env.chars().count(),
+            FormField::Project => self.project.chars().count(),
+            FormField::EnvVar => self.env_var.chars().count(),
+            FormField::Notes => self.notes.chars().count(),
+            FormField::CustomKey(i) => self.custom_fields.get(i).map(|f| f.key.chars().count()).unwrap_or(0),
+            FormField::CustomValue(i) => self.custom_fields.get(i).map(|f| f.value.chars().count()).unwrap_or(0),
+            FormField::CustomMasked(_) | FormField::AddField => 0,
+        };
+        if self.cursor < max {
+            self.cursor += 1;
+        }
+    }
+}
+
+/// Insert a character at `cursor` within `text`, advancing the cursor.
+fn text_insert(text: &mut String, cursor: &mut usize, c: char) {
+    let byte_idx = text
+        .char_indices()
+        .nth(*cursor)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    text.insert(byte_idx, c);
+    *cursor += 1;
+}
+
+/// Delete the character before `cursor` within `text`, retreating the cursor.
+fn text_delete_before(text: &mut String, cursor: &mut usize) {
+    if *cursor > 0 {
+        let prev = *cursor - 1;
+        let byte_idx = text
+            .char_indices()
+            .nth(prev)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let ch_len = text[byte_idx..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+        text.drain(byte_idx..byte_idx + ch_len);
+        *cursor = prev;
+    }
 }
 
 impl Default for FormField {
@@ -384,6 +506,8 @@ pub struct App {
     pub toast_at: Instant,
     /// Whether the toast represents a success (green) vs error/info.
     pub toast_ok: bool,
+    /// How long the toast should remain visible before auto-clearing.
+    pub toast_duration: Duration,
     pub show_secret_in_detail: bool,
     /// Selected field index in detail view (None = nothing selected, 0 = Secret, 1+ = custom fields).
     pub detail_field_sel: Option<usize>,
@@ -396,10 +520,38 @@ pub struct App {
     pub detail_scroll: u16,
     /// Buffer for the reveal-password prompt.
     pub reveal_password: String,
+    /// When true, the password prompt is gating an edit (not a reveal).
+    pub pending_edit: bool,
+    /// Cursor position within the search box.
+    pub search_cursor: usize,
+    /// Cursor position within the reveal-password prompt.
+    pub reveal_cursor: usize,
+    /// Path to the vault file (for settings display).
+    pub vault_path: PathBuf,
+    /// Settings tab.
+    pub settings_tab: SettingsTab,
+    /// New password input (settings → change password).
+    pub settings_new_pw: String,
+    /// Confirm password input.
+    pub settings_confirm_pw: String,
+    /// Which password field is focused: 0 = new, 1 = confirm.
+    pub settings_pw_field: usize,
+    /// Cursor in the password fields.
+    pub settings_pw_cursor: usize,
+    /// Cached token list for the settings → tokens tab.
+    pub settings_tokens: Vec<crate::db::TokenInfo>,
+    /// Selected token index in the tokens list.
+    pub settings_token_sel: usize,
+    /// Label input for creating a new token.
+    pub settings_token_label: String,
+    /// Cursor in the token label input.
+    pub settings_token_label_cursor: usize,
+    /// Whether the token label input is focused (vs the token list).
+    pub settings_token_creating: bool,
 }
 
 impl App {
-    fn new(vault: Vault) -> Self {
+    fn new(vault: Vault, vault_path: PathBuf) -> Self {
         let mut app = App {
             vault,
             mode: Mode::List,
@@ -423,6 +575,7 @@ impl App {
             toast: String::new(),
             toast_at: Instant::now(),
             toast_ok: false,
+            toast_duration: Duration::from_millis(1500),
             show_secret_in_detail: false,
             detail_field_sel: None,
             copied_field_idx: None,
@@ -430,6 +583,20 @@ impl App {
             copied_in_list: false,
             detail_scroll: 0,
             reveal_password: String::new(),
+            pending_edit: false,
+            search_cursor: 0,
+            reveal_cursor: 0,
+            vault_path,
+            settings_tab: SettingsTab::Password,
+            settings_new_pw: String::new(),
+            settings_confirm_pw: String::new(),
+            settings_pw_field: 0,
+            settings_pw_cursor: 0,
+            settings_tokens: Vec::new(),
+            settings_token_sel: 0,
+            settings_token_label: String::new(),
+            settings_token_label_cursor: 0,
+            settings_token_creating: false,
         };
         app.reload();
         app
@@ -503,17 +670,26 @@ impl App {
     }
 
     fn refresh_toast(&mut self) {
-        if !self.toast.is_empty() && self.toast_at.elapsed() > Duration::from_secs(4) {
+        if !self.toast.is_empty() && self.toast_at.elapsed() > self.toast_duration {
             self.toast.clear();
             self.toast_ok = false;
         }
     }
 
-    /// Set a success toast (rendered green).
+    /// Set a success toast (rendered green) with default duration.
     fn toast_ok_msg(&mut self, msg: impl Into<String>) {
         self.toast = msg.into();
         self.toast_at = Instant::now();
         self.toast_ok = true;
+        self.toast_duration = Duration::from_millis(1500);
+    }
+
+    /// Set a success toast with custom duration.
+    fn toast_ok_msg_for(&mut self, msg: impl Into<String>, dur: Duration) {
+        self.toast = msg.into();
+        self.toast_at = Instant::now();
+        self.toast_ok = true;
+        self.toast_duration = dur;
     }
 
     /// Set an error/info toast (rendered blue/red).
@@ -521,6 +697,7 @@ impl App {
         self.toast = msg.into();
         self.toast_at = Instant::now();
         self.toast_ok = false;
+        self.toast_duration = Duration::from_millis(1500);
     }
 
     fn selected_record(&self) -> Option<&CredentialRecord> {
@@ -556,6 +733,7 @@ impl App {
             Mode::ConfirmDelete => self.handle_confirm_delete(k),
             Mode::RevealPrompt => self.handle_reveal_prompt(k),
             Mode::Help => self.handle_help(k),
+            Mode::Settings => self.handle_settings(k),
         }
     }
 
@@ -597,19 +775,32 @@ impl App {
                 self.mode = Mode::FilterProject;
                 self.project_picker_sel = 0;
             }
-            KeyCode::Char('n') => self.start_add(),
+            KeyCode::Char('n') => {
+                if !self.deny_basic() {
+                    self.start_add();
+                }
+            }
             KeyCode::Char('?') => {
                 self.prev_mode = self.mode;
                 self.mode = Mode::Help;
             }
+            KeyCode::Char('s') => {
+                self.open_settings();
+            }
             KeyCode::Enter | KeyCode::Char('c') => return self.copy_selected(),
             KeyCode::Char('d') => {
-                if self.selected_record().is_some() {
+                if self.deny_basic() {
+                    // blocked
+                } else if self.selected_record().is_some() {
                     self.prev_mode = self.mode;
                     self.mode = Mode::ConfirmDelete;
                 }
             }
-            KeyCode::Char('r') => self.start_edit(),
+            KeyCode::Char('r') => {
+                if !self.deny_basic() {
+                    self.start_edit();
+                }
+            }
             KeyCode::Char('i') | KeyCode::Char(' ') => {
                 if let Some(rec) = self.selected_record().cloned() {
                     self.detail = self.vault.decrypt(&rec).ok();
@@ -682,7 +873,13 @@ impl App {
                 return None;
             }
             KeyCode::Char('n') => {
-                self.start_add();
+                if !self.deny_basic() {
+                    self.start_add();
+                }
+                return None;
+            }
+            KeyCode::Char('s') => {
+                self.open_settings();
                 return None;
             }
             // i/d/r/c are intentionally excluded (credential-specific).
@@ -710,6 +907,7 @@ impl App {
         match k.code {
             KeyCode::Esc => {
                 self.search.clear();
+                self.search_cursor = 0;
                 self.recompute_rows();
                 self.mode = Mode::List;
             }
@@ -717,12 +915,21 @@ impl App {
                 self.recompute_rows();
                 self.mode = Mode::List;
             }
+            KeyCode::Left => {
+                self.search_cursor = self.search_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                let max = self.search.chars().count();
+                if self.search_cursor < max {
+                    self.search_cursor += 1;
+                }
+            }
             KeyCode::Backspace => {
-                self.search.pop();
+                text_delete_before(&mut self.search, &mut self.search_cursor);
                 self.recompute_rows();
             }
             KeyCode::Char(c) => {
-                self.search.push(c);
+                text_insert(&mut self.search, &mut self.search_cursor, c);
                 self.recompute_rows();
             }
             _ => {}
@@ -794,12 +1001,312 @@ impl App {
         None
     }
 
+    /// Returns true and shows a toast if the current session lacks full
+    /// (master-password) permission. Use to gate write/reveal operations.
+    fn deny_basic(&mut self) -> bool {
+        if !self.vault.permission().is_full() {
+            self.toast = "Basic mode: this operation requires the master password.".into();
+            self.toast_at = Instant::now();
+            return true;
+        }
+        false
+    }
+
+    /// Open the settings popup.
+    fn open_settings(&mut self) {
+        self.settings_tab = SettingsTab::Password;
+        self.settings_new_pw.clear();
+        self.settings_confirm_pw.clear();
+        self.settings_pw_field = 0;
+        self.settings_pw_cursor = 0;
+        self.settings_token_label.clear();
+        self.settings_token_label_cursor = 0;
+        self.settings_token_creating = false;
+        self.settings_token_sel = 0;
+        self.settings_tokens = self.vault.list_tokens().unwrap_or_default();
+        self.prev_mode = self.mode;
+        self.mode = Mode::Settings;
+    }
+
+    fn handle_settings(&mut self, k: KeyEvent) -> Option<Action> {
+        // Tab cycles between settings tabs.
+        if k.code == KeyCode::Tab {
+            self.settings_tab = match self.settings_tab {
+                SettingsTab::Password => SettingsTab::Tokens,
+                SettingsTab::Tokens => SettingsTab::Info,
+                SettingsTab::Info => SettingsTab::Password,
+            };
+            return None;
+        }
+        // Esc closes settings.
+        if k.code == KeyCode::Esc {
+            self.mode = self.prev_mode;
+            return None;
+        }
+
+        match self.settings_tab {
+            SettingsTab::Password => self.handle_settings_password(k),
+            SettingsTab::Tokens => self.handle_settings_tokens(k),
+            SettingsTab::Info => {
+                // Info tab is read-only; just consume keys.
+                None
+            }
+        }
+    }
+
+    fn handle_settings_password(&mut self, k: KeyEvent) -> Option<Action> {
+        match k.code {
+            KeyCode::Up | KeyCode::BackTab => {
+                self.settings_pw_field = (self.settings_pw_field + 1) % 2;
+                let text = if self.settings_pw_field == 0 {
+                    &self.settings_new_pw
+                } else {
+                    &self.settings_confirm_pw
+                };
+                self.settings_pw_cursor = text.chars().count();
+            }
+            KeyCode::Down => {
+                self.settings_pw_field = (self.settings_pw_field + 1) % 2;
+                let text = if self.settings_pw_field == 0 {
+                    &self.settings_new_pw
+                } else {
+                    &self.settings_confirm_pw
+                };
+                self.settings_pw_cursor = text.chars().count();
+            }
+            KeyCode::Left => {
+                if self.settings_pw_cursor > 0 {
+                    self.settings_pw_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                let text = self.settings_pw_text();
+                let len = text.chars().count();
+                if self.settings_pw_cursor < len {
+                    self.settings_pw_cursor += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                let cursor = self.settings_pw_cursor;
+                let field = self.settings_pw_field;
+                let text = if field == 0 { &mut self.settings_new_pw } else { &mut self.settings_confirm_pw };
+                if cursor > 0 {
+                    let chars: Vec<char> = text.chars().collect();
+                    let new: String = chars[..cursor - 1]
+                        .iter()
+                        .chain(chars[cursor..].iter())
+                        .collect();
+                    *text = new;
+                    self.settings_pw_cursor = cursor - 1;
+                }
+            }
+            KeyCode::Char(c) => {
+                let cursor = self.settings_pw_cursor;
+                let field = self.settings_pw_field;
+                let text = if field == 0 { &mut self.settings_new_pw } else { &mut self.settings_confirm_pw };
+                let chars: Vec<char> = text.chars().collect();
+                let new: String = chars[..cursor]
+                    .iter()
+                    .chain(std::iter::once(&c))
+                    .chain(chars[cursor..].iter())
+                    .collect();
+                *text = new;
+                self.settings_pw_cursor = cursor + 1;
+            }
+            KeyCode::Enter => {
+                // In the "new password" field, Enter moves to "confirm password".
+                if self.settings_pw_field == 0 {
+                    self.settings_pw_field = 1;
+                    self.settings_pw_cursor = self.settings_confirm_pw.chars().count();
+                    return None;
+                }
+                // In the "confirm password" field, Enter submits.
+                if self.settings_new_pw.is_empty() {
+                    self.toast_info("New password cannot be empty.");
+                    return None;
+                }
+                if self.settings_new_pw != self.settings_confirm_pw {
+                    self.toast_info("Passwords do not match.");
+                    return None;
+                }
+                match self.vault.change_password(&self.settings_new_pw) {
+                    Ok(()) => {
+                        self.toast_ok_msg_for(
+                            "Master password changed. All tokens revoked.",
+                            Duration::from_millis(1500),
+                        );
+                        self.settings_new_pw.clear();
+                        self.settings_confirm_pw.clear();
+                        self.settings_pw_cursor = 0;
+                        self.settings_pw_field = 0;
+                        self.mode = self.prev_mode;
+                    }
+                    Err(e) => {
+                        self.toast_info(format!("Failed: {e}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn settings_pw_text(&self) -> &str {
+        if self.settings_pw_field == 0 {
+            &self.settings_new_pw
+        } else {
+            &self.settings_confirm_pw
+        }
+    }
+
+    fn handle_settings_tokens(&mut self, k: KeyEvent) -> Option<Action> {
+        if self.settings_token_creating {
+            // Label input is focused.
+            match k.code {
+                KeyCode::Esc => {
+                    self.settings_token_creating = false;
+                    self.settings_token_label.clear();
+                    self.settings_token_label_cursor = 0;
+                }
+                KeyCode::Enter => {
+                    let label = if self.settings_token_label.is_empty() {
+                        format!("token-{}", self.settings_tokens.len() + 1)
+                    } else {
+                        self.settings_token_label.clone()
+                    };
+                    match self.vault.create_token(&label) {
+                        Ok(token) => {
+                            match crate::clipboard::copy_and_clear_after(&token, 60) {
+                                Ok(_) => {
+                                    self.toast = format!("Token `{}` copied to clipboard (60s).", label);
+                                    self.toast_ok = true;
+                                }
+                                Err(_) => {
+                                    self.toast = format!("Token created but clipboard failed: {}", token);
+                                    self.toast_ok = false;
+                                }
+                            }
+                            self.toast_at = Instant::now();
+                            self.settings_tokens = self.vault.list_tokens().unwrap_or_default();
+                            self.settings_token_creating = false;
+                            self.settings_token_label.clear();
+                            self.settings_token_label_cursor = 0;
+                        }
+                        Err(e) => {
+                            self.toast = format!("Failed: {e}");
+                            self.toast_at = Instant::now();
+                            self.toast_ok = false;
+                        }
+                    }
+                }
+                KeyCode::Left => {
+                    if self.settings_token_label_cursor > 0 {
+                        self.settings_token_label_cursor -= 1;
+                    }
+                }
+                KeyCode::Right => {
+                    let len = self.settings_token_label.chars().count();
+                    if self.settings_token_label_cursor < len {
+                        self.settings_token_label_cursor += 1;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if self.settings_token_label_cursor > 0 {
+                        let chars: Vec<char> = self.settings_token_label.chars().collect();
+                        let new: String = chars[..self.settings_token_label_cursor - 1]
+                            .iter()
+                            .chain(chars[self.settings_token_label_cursor..].iter())
+                            .collect();
+                        self.settings_token_label = new;
+                        self.settings_token_label_cursor -= 1;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    let chars: Vec<char> = self.settings_token_label.chars().collect();
+                    let new: String = chars[..self.settings_token_label_cursor]
+                        .iter()
+                        .chain(std::iter::once(&c))
+                        .chain(chars[self.settings_token_label_cursor..].iter())
+                        .collect();
+                    self.settings_token_label = new;
+                    self.settings_token_label_cursor += 1;
+                }
+                _ => {}
+            }
+            return None;
+        }
+
+        // Token list navigation.
+        match k.code {
+            KeyCode::Up => {
+                if self.settings_token_sel > 0 {
+                    self.settings_token_sel -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.settings_token_sel + 1 < self.settings_tokens.len() {
+                    self.settings_token_sel += 1;
+                }
+            }
+            KeyCode::Char('c') | KeyCode::Char('n') => {
+                if self.vault.permission().is_full() {
+                    self.settings_token_creating = true;
+                    self.settings_token_label.clear();
+                    self.settings_token_label_cursor = 0;
+                } else {
+                    self.toast = "Basic mode: cannot create tokens.".into();
+                    self.toast_at = Instant::now();
+                    self.toast_ok = false;
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Delete => {
+                if let Some(t) = self.settings_tokens.get(self.settings_token_sel) {
+                    let query = t.id.to_string();
+                    match self.vault.revoke_token(&query) {
+                        Ok(true) => {
+                            self.toast = format!("Token `{}` revoked.", t.label);
+                            self.toast_ok = true;
+                            self.toast_at = Instant::now();
+                            self.settings_tokens = self.vault.list_tokens().unwrap_or_default();
+                            if self.settings_token_sel >= self.settings_tokens.len() {
+                                self.settings_token_sel = self.settings_tokens.len().saturating_sub(1);
+                            }
+                        }
+                        Ok(false) => {
+                            self.toast = "Token not found.".into();
+                            self.toast_at = Instant::now();
+                            self.toast_ok = false;
+                        }
+                        Err(e) => {
+                            self.toast = format!("Failed: {e}");
+                            self.toast_at = Instant::now();
+                            self.toast_ok = false;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     fn start_add(&mut self) {
         self.form = Form::new();
         self.mode = Mode::Add;
     }
 
     fn start_edit(&mut self) {
+        if self.selected_record().is_some() {
+            self.reveal_password.clear();
+            self.reveal_cursor = 0;
+            self.pending_edit = true;
+            self.prev_mode = self.mode;
+            self.mode = Mode::RevealPrompt;
+        }
+    }
+
+    /// Actual edit setup — called after the master password is verified.
+    fn do_edit(&mut self) {
         if let Some(rec) = self.selected_record().cloned() {
             if let Ok(dec) = self.vault.decrypt(&rec) {
                 let detected = credential::detect(&dec.secret);
@@ -829,7 +1336,9 @@ impl App {
                     detection: Some(detected),
                     editing_id: Some(dec.id),
                     custom_fields,
+                    cursor: 0,
                 };
+                self.form.sync_cursor_to_end();
                 self.mode = Mode::Edit;
             }
         }
@@ -842,9 +1351,18 @@ impl App {
         if self.form.field == FormField::Kind {
             match k.code {
                 KeyCode::Esc => self.mode = Mode::List,
-                KeyCode::Tab | KeyCode::Down => self.form.field = self.form.field.next(&self.form),
-                KeyCode::BackTab | KeyCode::Up => self.form.field = self.form.field.prev(&self.form),
-                KeyCode::Enter => self.form.field = self.form.field.next(&self.form),
+                KeyCode::Tab | KeyCode::Down => {
+                    self.form.field = self.form.field.next(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.form.field = self.form.field.prev(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
+                KeyCode::Enter => {
+                    self.form.field = self.form.field.next(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
                 KeyCode::Left => self.cycle_kind(-1),
                 KeyCode::Right => self.cycle_kind(1),
                 KeyCode::Backspace => self.backspace_kind(),
@@ -868,10 +1386,19 @@ impl App {
         if let FormField::CustomMasked(i) = self.form.field {
             match k.code {
                 KeyCode::Esc => self.mode = Mode::List,
-                KeyCode::Tab => self.form.field = self.form.field.next(&self.form),
-                KeyCode::BackTab => self.form.field = self.form.field.prev(&self.form),
-                KeyCode::Enter => self.form.field = self.form.field.next(&self.form),
-                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
+                KeyCode::Tab | KeyCode::Down => {
+                    self.form.field = self.form.field.next(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.form.field = self.form.field.prev(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
+                KeyCode::Enter => {
+                    self.form.field = self.form.field.next(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
                     if let Some(f) = self.form.custom_fields.get_mut(i) {
                         f.masked = !f.masked;
                     }
@@ -886,12 +1413,19 @@ impl App {
         if self.form.field == FormField::AddField {
             match k.code {
                 KeyCode::Esc => self.mode = Mode::List,
-                KeyCode::Tab => self.form.field = self.form.field.next(&self.form),
-                KeyCode::BackTab => self.form.field = self.form.field.prev(&self.form),
+                KeyCode::Tab | KeyCode::Down => {
+                    self.form.field = self.form.field.next(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.form.field = self.form.field.prev(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
                 KeyCode::Enter => {
                     self.form.custom_fields.push(CustomFieldForm::default());
                     let idx = self.form.custom_fields.len() - 1;
                     self.form.field = FormField::CustomKey(idx);
+                    self.form.sync_cursor_to_end();
                 }
                 _ => {}
             }
@@ -902,18 +1436,25 @@ impl App {
         if matches!(self.form.field, FormField::CustomKey(_) | FormField::CustomValue(_)) {
             match k.code {
                 KeyCode::Esc => self.mode = Mode::List,
-                KeyCode::Tab => self.form.field = self.form.field.next(&self.form),
-                KeyCode::BackTab => self.form.field = self.form.field.prev(&self.form),
-                KeyCode::Enter => self.form.field = self.form.field.next(&self.form),
+                KeyCode::Tab | KeyCode::Down => {
+                    self.form.field = self.form.field.next(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.form.field = self.form.field.prev(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
+                KeyCode::Enter => {
+                    self.form.field = self.form.field.next(&self.form);
+                    self.form.sync_cursor_to_end();
+                }
+                KeyCode::Left => self.form.cursor_left(),
+                KeyCode::Right => self.form.cursor_right(),
                 KeyCode::Backspace => {
-                    if let Some(f) = self.form.current_field_mut() {
-                        f.pop();
-                    }
+                    self.form.delete_before_cursor();
                 }
                 KeyCode::Char(c) => {
-                    if let Some(f) = self.form.current_field_mut() {
-                        f.push(c);
-                    }
+                    self.form.insert_char(c);
                 }
                 _ => {}
             }
@@ -923,24 +1464,31 @@ impl App {
         // Standard text fields.
         match k.code {
             KeyCode::Esc => self.mode = Mode::List,
-            KeyCode::Tab | KeyCode::Down => self.form.field = self.form.field.next(&self.form),
-            KeyCode::BackTab | KeyCode::Up => self.form.field = self.form.field.prev(&self.form),
+            KeyCode::Tab | KeyCode::Down => {
+                self.form.field = self.form.field.next(&self.form);
+                self.form.sync_cursor_to_end();
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.form.field = self.form.field.prev(&self.form);
+                self.form.sync_cursor_to_end();
+            }
             KeyCode::Enter if self.form.field == FormField::Notes => {
                 return self.save_form();
             }
-            KeyCode::Enter => self.form.field = self.form.field.next(&self.form),
+            KeyCode::Enter => {
+                self.form.field = self.form.field.next(&self.form);
+                self.form.sync_cursor_to_end();
+            }
+            KeyCode::Left => self.form.cursor_left(),
+            KeyCode::Right => self.form.cursor_right(),
             KeyCode::Backspace => {
-                if let Some(f) = self.form.current_field_mut() {
-                    f.pop();
-                }
+                self.form.delete_before_cursor();
                 if self.form.field == FormField::Secret {
                     self.form.recompute_detection();
                 }
             }
             KeyCode::Char(c) => {
-                if let Some(f) = self.form.current_field_mut() {
-                    f.push(c);
-                }
+                self.form.insert_char(c);
                 if self.form.field == FormField::Secret {
                     self.form.recompute_detection();
                 }
@@ -1155,14 +1703,17 @@ impl App {
             KeyCode::Char('s') => {
                 if self.show_secret_in_detail {
                     self.show_secret_in_detail = false;
-                } else {
+                } else if !self.deny_basic() {
                     self.reveal_password.clear();
+                    self.reveal_cursor = 0;
                     self.prev_mode = Mode::Detail;
                     self.mode = Mode::RevealPrompt;
                 }
             }
             KeyCode::Char('e') => {
-                self.start_edit();
+                if !self.deny_basic() {
+                    self.start_edit();
+                }
             }
             _ => {}
         }
@@ -1198,32 +1749,50 @@ impl App {
         })
     }
 
-    /// Password confirmation prompt for revealing a secret in plaintext.
+    /// Password confirmation prompt for revealing a secret or editing a credential.
     fn handle_reveal_prompt(&mut self, k: KeyEvent) -> Option<Action> {
         match k.code {
             KeyCode::Esc => {
                 self.reveal_password.clear();
+                self.reveal_cursor = 0;
+                self.pending_edit = false;
                 self.mode = self.prev_mode;
             }
             KeyCode::Enter => {
                 let pw = std::mem::take(&mut self.reveal_password);
+                self.reveal_cursor = 0;
                 if self.vault.verify_password(&pw) {
-                    self.show_secret_in_detail = true;
-                    self.toast = "Secret revealed.".into();
-                    self.toast_at = Instant::now();
-                    self.mode = self.prev_mode;
+                    if self.pending_edit {
+                        self.pending_edit = false;
+                        self.do_edit();
+                    } else {
+                        self.show_secret_in_detail = true;
+                        self.toast = "Secret revealed.".into();
+                        self.toast_at = Instant::now();
+                        self.mode = self.prev_mode;
+                    }
                 } else {
                     self.toast = "Wrong password.".into();
                     self.toast_at = Instant::now();
                     self.reveal_password.clear();
+                    self.pending_edit = false;
                     self.mode = self.prev_mode;
                 }
             }
+            KeyCode::Left => {
+                self.reveal_cursor = self.reveal_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                let max = self.reveal_password.chars().count();
+                if self.reveal_cursor < max {
+                    self.reveal_cursor += 1;
+                }
+            }
             KeyCode::Backspace => {
-                self.reveal_password.pop();
+                text_delete_before(&mut self.reveal_password, &mut self.reveal_cursor);
             }
             KeyCode::Char(c) => {
-                self.reveal_password.push(c);
+                text_insert(&mut self.reveal_password, &mut self.reveal_cursor, c);
             }
             _ => {}
         }
