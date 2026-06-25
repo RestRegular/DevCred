@@ -9,6 +9,7 @@ mod credential;
 mod crypto;
 mod db;
 mod injector;
+mod transfer;
 mod tui;
 
 use clap::Parser;

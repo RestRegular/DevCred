@@ -20,6 +20,7 @@ mod ui;
 use crate::credential::{self, CredentialKind};
 use crate::db::{CredentialRecord, DecryptedCredential, Vault};
 use crate::clipboard;
+use crate::transfer;
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -236,6 +237,7 @@ pub enum Mode {
     Detail,
     ConfirmDelete,
     RevealPrompt,
+    PermissionPrompt,
     Help,
     Settings,
 }
@@ -246,6 +248,7 @@ pub enum SettingsTab {
     Password,
     Tokens,
     Info,
+    Backup,
 }
 
 /// Which pane has keyboard focus in the main list view.
@@ -255,6 +258,18 @@ pub enum Focus {
     Category,
     /// Right pane: credential list.
     List,
+}
+
+/// What operation was pending when the permission prompt appeared.
+/// After a successful vault upgrade, the pending action is executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingAction {
+    None,
+    AddCredential,
+    EditCredential,
+    DeleteCredential,
+    RevealSecret,
+    EditFromDetail,
 }
 
 /// A credential row in the filtered, sorted view.
@@ -522,6 +537,8 @@ pub struct App {
     pub reveal_password: String,
     /// When true, the password prompt is gating an edit (not a reveal).
     pub pending_edit: bool,
+    /// What action to execute after a successful permission upgrade.
+    pub pending_action: PendingAction,
     /// Cursor position within the search box.
     pub search_cursor: usize,
     /// Cursor position within the reveal-password prompt.
@@ -548,6 +565,21 @@ pub struct App {
     pub settings_token_label_cursor: usize,
     /// Whether the token label input is focused (vs the token list).
     pub settings_token_creating: bool,
+    // ── Backup tab ──
+    /// Which field is focused in the backup tab: 0 = export path, 1 = import path.
+    pub settings_backup_field: usize,
+    /// Export file path input.
+    pub settings_backup_export_path: String,
+    /// Cursor in the export path input.
+    pub settings_backup_export_cursor: usize,
+    /// Import file path input.
+    pub settings_backup_import_path: String,
+    /// Cursor in the import path input.
+    pub settings_backup_import_cursor: usize,
+    /// Export: metadata only (no secrets).
+    pub settings_backup_no_reveal: bool,
+    /// Import: overwrite existing credentials.
+    pub settings_backup_overwrite: bool,
 }
 
 impl App {
@@ -584,6 +616,7 @@ impl App {
             detail_scroll: 0,
             reveal_password: String::new(),
             pending_edit: false,
+            pending_action: PendingAction::None,
             search_cursor: 0,
             reveal_cursor: 0,
             vault_path,
@@ -597,6 +630,13 @@ impl App {
             settings_token_label: String::new(),
             settings_token_label_cursor: 0,
             settings_token_creating: false,
+            settings_backup_field: 0,
+            settings_backup_export_path: String::new(),
+            settings_backup_export_cursor: 0,
+            settings_backup_import_path: String::new(),
+            settings_backup_import_cursor: 0,
+            settings_backup_no_reveal: false,
+            settings_backup_overwrite: false,
         };
         app.reload();
         app
@@ -732,6 +772,7 @@ impl App {
             Mode::Detail => self.handle_detail(k),
             Mode::ConfirmDelete => self.handle_confirm_delete(k),
             Mode::RevealPrompt => self.handle_reveal_prompt(k),
+            Mode::PermissionPrompt => self.handle_permission_prompt(k),
             Mode::Help => self.handle_help(k),
             Mode::Settings => self.handle_settings(k),
         }
@@ -776,7 +817,7 @@ impl App {
                 self.project_picker_sel = 0;
             }
             KeyCode::Char('n') => {
-                if !self.deny_basic() {
+                if !self.require_full(PendingAction::AddCredential) {
                     self.start_add();
                 }
             }
@@ -789,15 +830,15 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char('c') => return self.copy_selected(),
             KeyCode::Char('d') => {
-                if self.deny_basic() {
-                    // blocked
-                } else if self.selected_record().is_some() {
-                    self.prev_mode = self.mode;
-                    self.mode = Mode::ConfirmDelete;
+                if !self.require_full(PendingAction::DeleteCredential) {
+                    if self.selected_record().is_some() {
+                        self.prev_mode = self.mode;
+                        self.mode = Mode::ConfirmDelete;
+                    }
                 }
             }
             KeyCode::Char('r') => {
-                if !self.deny_basic() {
+                if !self.require_full(PendingAction::EditCredential) {
                     self.start_edit();
                 }
             }
@@ -873,7 +914,7 @@ impl App {
                 return None;
             }
             KeyCode::Char('n') => {
-                if !self.deny_basic() {
+                if !self.require_full(PendingAction::AddCredential) {
                     self.start_add();
                 }
                 return None;
@@ -1002,11 +1043,27 @@ impl App {
     }
 
     /// Returns true and shows a toast if the current session lacks full
-    /// (master-password) permission. Use to gate write/reveal operations.
+    /// (master-password) permission. Use to gate write/reveal operations
+    /// in contexts where a popup doesn't make sense (e.g. settings).
     fn deny_basic(&mut self) -> bool {
         if !self.vault.permission().is_full() {
-            self.toast = "Basic mode: this operation requires the master password.".into();
-            self.toast_at = Instant::now();
+            self.toast_info("Basic mode: this operation requires the vault password.");
+            return true;
+        }
+        false
+    }
+
+    /// Returns true and shows a permission prompt popup if the current
+    /// session lacks full permission. The pending action is stored so it
+    /// can be executed after a successful vault upgrade. Use this instead
+    /// of deny_basic() for main-view operations (add, edit, delete, reveal).
+    fn require_full(&mut self, action: PendingAction) -> bool {
+        if !self.vault.permission().is_full() {
+            self.pending_action = action;
+            self.reveal_password.clear();
+            self.reveal_cursor = 0;
+            self.prev_mode = self.mode;
+            self.mode = Mode::PermissionPrompt;
             return true;
         }
         false
@@ -1024,6 +1081,13 @@ impl App {
         self.settings_token_creating = false;
         self.settings_token_sel = 0;
         self.settings_tokens = self.vault.list_tokens().unwrap_or_default();
+        self.settings_backup_field = 0;
+        self.settings_backup_export_path.clear();
+        self.settings_backup_export_cursor = 0;
+        self.settings_backup_import_path.clear();
+        self.settings_backup_import_cursor = 0;
+        self.settings_backup_no_reveal = false;
+        self.settings_backup_overwrite = false;
         self.prev_mode = self.mode;
         self.mode = Mode::Settings;
     }
@@ -1034,7 +1098,8 @@ impl App {
             self.settings_tab = match self.settings_tab {
                 SettingsTab::Password => SettingsTab::Tokens,
                 SettingsTab::Tokens => SettingsTab::Info,
-                SettingsTab::Info => SettingsTab::Password,
+                SettingsTab::Info => SettingsTab::Backup,
+                SettingsTab::Backup => SettingsTab::Password,
             };
             return None;
         }
@@ -1051,10 +1116,14 @@ impl App {
                 // Info tab is read-only; just consume keys.
                 None
             }
+            SettingsTab::Backup => self.handle_settings_backup(k),
         }
     }
 
     fn handle_settings_password(&mut self, k: KeyEvent) -> Option<Action> {
+        if self.deny_basic() {
+            return None;
+        }
         match k.code {
             KeyCode::Up | KeyCode::BackTab => {
                 self.settings_pw_field = (self.settings_pw_field + 1) % 2;
@@ -1132,7 +1201,7 @@ impl App {
                 match self.vault.change_password(&self.settings_new_pw) {
                     Ok(()) => {
                         self.toast_ok_msg_for(
-                            "Master password changed. All tokens revoked.",
+                            "Vault password changed. All tokens revoked.",
                             Duration::from_millis(1500),
                         );
                         self.settings_new_pw.clear();
@@ -1160,6 +1229,9 @@ impl App {
     }
 
     fn handle_settings_tokens(&mut self, k: KeyEvent) -> Option<Action> {
+        if self.deny_basic() {
+            return None;
+        }
         if self.settings_token_creating {
             // Label input is focused.
             match k.code {
@@ -1288,6 +1360,303 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    fn handle_settings_backup(&mut self, k: KeyEvent) -> Option<Action> {
+        // Up/Down switches between export (0) and import (1) fields.
+        if k.code == KeyCode::Up || k.code == KeyCode::Down {
+            self.settings_backup_field = 1 - self.settings_backup_field;
+            return None;
+        }
+        // Space toggles the relevant option.
+        if k.code == KeyCode::Char(' ') {
+            if self.settings_backup_field == 0 {
+                self.settings_backup_no_reveal = !self.settings_backup_no_reveal;
+            } else {
+                self.settings_backup_overwrite = !self.settings_backup_overwrite;
+            }
+            return None;
+        }
+
+        match self.settings_backup_field {
+            0 => {
+                // Export path field.
+                match k.code {
+                    KeyCode::Enter => {
+                        self.do_export();
+                    }
+                    KeyCode::Left => {
+                        if self.settings_backup_export_cursor > 0 {
+                            self.settings_backup_export_cursor -= 1;
+                        }
+                    }
+                    KeyCode::Right => {
+                        if self.settings_backup_export_cursor < self.settings_backup_export_path.chars().count() {
+                            self.settings_backup_export_cursor += 1;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        text_delete_before(
+                            &mut self.settings_backup_export_path,
+                            &mut self.settings_backup_export_cursor,
+                        );
+                    }
+                    KeyCode::Char(c) => {
+                        text_insert(
+                            &mut self.settings_backup_export_path,
+                            &mut self.settings_backup_export_cursor,
+                            c,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            1 => {
+                // Import path field.
+                match k.code {
+                    KeyCode::Enter => {
+                        self.do_import();
+                    }
+                    KeyCode::Left => {
+                        if self.settings_backup_import_cursor > 0 {
+                            self.settings_backup_import_cursor -= 1;
+                        }
+                    }
+                    KeyCode::Right => {
+                        if self.settings_backup_import_cursor < self.settings_backup_import_path.chars().count() {
+                            self.settings_backup_import_cursor += 1;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        text_delete_before(
+                            &mut self.settings_backup_import_path,
+                            &mut self.settings_backup_import_cursor,
+                        );
+                    }
+                    KeyCode::Char(c) => {
+                        text_insert(
+                            &mut self.settings_backup_import_path,
+                            &mut self.settings_backup_import_cursor,
+                            c,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Execute export from the Backup tab.
+    fn do_export(&mut self) {
+        let path_str = self.settings_backup_export_path.trim().to_string();
+        if path_str.is_empty() {
+            self.toast_info("Enter a file path first");
+            return;
+        }
+        let path = PathBuf::from(&path_str);
+
+        // Auto-detect format from extension.
+        let fmt = transfer::detect_format(&path).unwrap_or("json");
+        if fmt == "xlsx" {
+            // XLSX is binary — can't write to stdout, but we have a file path.
+        }
+
+        // Check permissions for secret export.
+        let no_reveal = self.settings_backup_no_reveal;
+        if !no_reveal && !self.vault.permission().is_full() {
+            self.toast_info("Export with secrets requires master password");
+            return;
+        }
+
+        // List and decrypt credentials.
+        let records = match self.vault.list(None, None) {
+            Ok(r) => r,
+            Err(e) => {
+                self.toast_info(&format!("Export failed: {}", e));
+                return;
+            }
+        };
+        if records.is_empty() {
+            self.toast_info("Vault is empty — nothing to export");
+            return;
+        }
+
+        let mut decrypted = Vec::with_capacity(records.len());
+        for rec in &records {
+            match self.vault.decrypt(rec) {
+                Ok(d) => decrypted.push(d),
+                Err(e) => {
+                    self.toast_info(&format!("Decrypt error: {}", e));
+                    return;
+                }
+            }
+        }
+
+        // Generate and write output.
+        let result = (|| -> anyhow::Result<()> {
+            match fmt {
+                "json" => {
+                    let content = transfer::export_json(&decrypted, no_reveal)?;
+                    std::fs::write(&path, &content)
+                        .with_context(|| format!("writing to {}", path.display()))?;
+                    Ok(())
+                }
+                "csv" => {
+                    let content = transfer::export_csv(&decrypted, no_reveal)?;
+                    std::fs::write(&path, &content)
+                        .with_context(|| format!("writing to {}", path.display()))?;
+                    Ok(())
+                }
+                "xlsx" => {
+                    transfer::export_xlsx(&decrypted, no_reveal, &path)?;
+                    Ok(())
+                }
+                _ => unreachable!(),
+            }
+})();
+
+        match result {
+            Ok(()) => {
+                let msg = if no_reveal {
+                    format!("Exported {} credentials (metadata) → {}", decrypted.len(), path.display())
+                } else {
+                    format!("Exported {} credentials → {}", decrypted.len(), path.display())
+                };
+                self.toast_ok_msg(&msg);
+            }
+            Err(e) => {
+                self.toast_info(&format!("Export failed: {}", e));
+            }
+        }
+    }
+
+    /// Execute import from the Backup tab.
+    fn do_import(&mut self) {
+        let path_str = self.settings_backup_import_path.trim().to_string();
+        if path_str.is_empty() {
+            self.toast_info("Enter a file path first");
+            return;
+        }
+        let path = PathBuf::from(&path_str);
+
+        // Import requires Full permission.
+        if !self.vault.permission().is_full() {
+            self.toast_info("Import requires master password");
+            return;
+        }
+
+        // Read file.
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.toast_info(&format!("Cannot read file: {}", e));
+                return;
+            }
+        };
+
+        // Detect format.
+        let fmt = transfer::detect_format(&path);
+        let fmt = match fmt {
+            Some(f) => f,
+            None => {
+                self.toast_info("Cannot detect format from extension (use .json/.csv/.txt)");
+                return;
+            }
+        };
+
+        // Parse entries.
+        let entries = match fmt {
+            "json" => transfer::parse_json(&content),
+            "csv" => transfer::parse_csv(&content),
+            "txt" => transfer::parse_txt(&content),
+            _ => {
+                self.toast_info("Unsupported format");
+                return;
+            }
+        };
+
+        let entries = match entries {
+            Ok(e) => e,
+            Err(e) => {
+                self.toast_info(&format!("Parse error: {}", e));
+                return;
+            }
+        };
+
+        if entries.is_empty() {
+            self.toast_info("No entries found in file");
+            return;
+        }
+
+        let total = entries.len();
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = 0usize;
+        let overwrite = self.settings_backup_overwrite;
+
+        for entry in &entries {
+            // Check for duplicate.
+            let existing = match self.vault.find_by_name(&entry.name) {
+                Ok(opt) => opt,
+                Err(_) => None,
+            };
+
+            if let Some(rec) = existing {
+                if !overwrite {
+                    skipped += 1;
+                    continue;
+                }
+                // Delete existing before re-adding.
+                let _ = self.vault.delete(rec.id);
+            }
+
+            // Determine kind.
+            let kind = if entry.kind.is_empty() {
+                credential::detect(&entry.secret).kind
+            } else {
+                crate::db::parse_kind(&entry.kind)
+            };
+
+            // Add credential.
+            match self.vault.add(
+                &entry.name,
+                kind,
+                entry.env.as_deref().unwrap_or(""),
+                entry.project.as_deref().unwrap_or(""),
+                &entry.secret,
+                entry.env_var.as_deref().unwrap_or(""),
+                entry.notes.as_deref().unwrap_or(""),
+            ) {
+                Ok(id) => {
+                    // Set custom fields if any.
+                    if !entry.custom_fields.is_empty() {
+                        let fields: Vec<(String, String, bool)> = entry.custom_fields.iter()
+                            .map(|f| (f.key.clone(), f.value.clone(), f.masked))
+                            .collect();
+                        let _ = self.vault.set_custom_fields(id, &fields);
+                    }
+                    imported += 1;
+                }
+                Err(_) => {
+                    errors += 1;
+                }
+            }
+        }
+
+        // Reload the app state.
+        self.reload();
+
+        let msg = format!(
+            "Import: {} total, {} imported, {} skipped, {} errors",
+            total, imported, skipped, errors
+        );
+        if errors > 0 {
+            self.toast_info(&msg);
+        } else {
+            self.toast_ok_msg(&msg);
+        }
     }
 
     fn start_add(&mut self) {
@@ -1703,7 +2072,7 @@ impl App {
             KeyCode::Char('s') => {
                 if self.show_secret_in_detail {
                     self.show_secret_in_detail = false;
-                } else if !self.deny_basic() {
+                } else if !self.require_full(PendingAction::RevealSecret) {
                     self.reveal_password.clear();
                     self.reveal_cursor = 0;
                     self.prev_mode = Mode::Detail;
@@ -1711,7 +2080,7 @@ impl App {
                 }
             }
             KeyCode::Char('e') => {
-                if !self.deny_basic() {
+                if !self.require_full(PendingAction::EditFromDetail) {
                     self.start_edit();
                 }
             }
@@ -1777,6 +2146,77 @@ impl App {
                     self.reveal_password.clear();
                     self.pending_edit = false;
                     self.mode = self.prev_mode;
+                }
+            }
+            KeyCode::Left => {
+                self.reveal_cursor = self.reveal_cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                let max = self.reveal_password.chars().count();
+                if self.reveal_cursor < max {
+                    self.reveal_cursor += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                text_delete_before(&mut self.reveal_password, &mut self.reveal_cursor);
+            }
+            KeyCode::Char(c) => {
+                text_insert(&mut self.reveal_password, &mut self.reveal_cursor, c);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Handle the permission upgrade prompt. The user enters the master
+    /// password to elevate a basic (token) session to full permission.
+    /// On success, the pending action is executed. On failure, the popup
+    /// stays open for retry. Esc cancels and returns to the previous mode.
+    fn handle_permission_prompt(&mut self, k: KeyEvent) -> Option<Action> {
+        match k.code {
+            KeyCode::Esc => {
+                self.reveal_password.clear();
+                self.reveal_cursor = 0;
+                self.pending_action = PendingAction::None;
+                self.mode = self.prev_mode;
+                self.toast_info("Operation cancelled — basic mode.");
+            }
+            KeyCode::Enter => {
+                let pw = std::mem::take(&mut self.reveal_password);
+                self.reveal_cursor = 0;
+                match self.vault.upgrade_to_full(&pw) {
+                    Ok(()) => {
+                        self.toast_ok_msg("Vault unlocked — full access granted.");
+                        let action = self.pending_action;
+                        self.pending_action = PendingAction::None;
+                        self.mode = self.prev_mode;
+                        // Execute the pending action now that we have full access.
+                        match action {
+                            PendingAction::AddCredential => self.start_add(),
+                            PendingAction::EditCredential => self.start_edit(),
+                            PendingAction::DeleteCredential => {
+                                if self.selected_record().is_some() {
+                                    self.prev_mode = self.mode;
+                                    self.mode = Mode::ConfirmDelete;
+                                }
+                            }
+                            PendingAction::RevealSecret => {
+                                // Enter RevealPrompt for the extra confirm step.
+                                self.reveal_password.clear();
+                                self.reveal_cursor = 0;
+                                self.prev_mode = Mode::Detail;
+                                self.mode = Mode::RevealPrompt;
+                            }
+                            PendingAction::EditFromDetail => self.start_edit(),
+                            PendingAction::None => {}
+                        }
+                    }
+                    Err(_) => {
+                        // Wrong password — stay in popup for retry.
+                        self.toast_info("Wrong password. Try again or press Esc to cancel.");
+                        self.reveal_password.clear();
+                        self.reveal_cursor = 0;
+                    }
                 }
             }
             KeyCode::Left => {

@@ -2,6 +2,7 @@
 
 use crate::credential::CredentialKind;
 use crate::tui::{App, Focus, FormField, Mode};
+use crate::transfer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -9,6 +10,7 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState,
 };
 use ratatui::Frame;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Accent color used for highlights and the selected row.
@@ -38,6 +40,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Detail => draw_detail(f, app),
         Mode::ConfirmDelete => draw_confirm_delete(f, app),
         Mode::RevealPrompt => draw_reveal_prompt(f, app),
+        Mode::PermissionPrompt => draw_permission_prompt(f, app),
         Mode::Help => draw_help(f, app),
         Mode::Settings => draw_settings(f, app),
         Mode::List => {}
@@ -252,18 +255,23 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         // Separator
         Span::styled("|", Style::default().fg(DIM)),
         Span::raw("  "),
-        // Credential-specific keys (right side)
-        Span::styled("n", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::raw(":new  "),
-        Span::styled("c/↲", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::raw(":copy  "),
-        Span::styled("i", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::raw(":detail  "),
-        Span::styled("r", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::raw(":edit  "),
-        Span::styled("d", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::raw(":delete"),
     ]);
+    // Credential-specific keys (right side).
+    // Full-only keys (n:new, r:edit, d:delete) are hidden in basic mode.
+    if !is_basic {
+        hint_spans.push(Span::styled("n", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        hint_spans.push(Span::raw(":new  "));
+    }
+    hint_spans.push(Span::styled("c/↲", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+    hint_spans.push(Span::raw(":copy  "));
+    hint_spans.push(Span::styled("i", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+    hint_spans.push(Span::raw(":detail  "));
+    if !is_basic {
+        hint_spans.push(Span::styled("r", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        hint_spans.push(Span::raw(":edit  "));
+        hint_spans.push(Span::styled("d", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        hint_spans.push(Span::raw(":delete"));
+    }
     let hint = Line::from(hint_spans);
 
     let block = Block::default().borders(Borders::ALL);
@@ -868,7 +876,8 @@ fn draw_detail(f: &mut Frame, app: &App) {
         Span::raw(fmt_ts(d.updated_at)),
     ]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
+    let is_basic = !app.vault.permission().is_full();
+    let mut hint_spans = vec![
         Span::styled(" Tab/↑↓ ", Style::default().bg(DIM).fg(Color::Black)),
         Span::raw(" select  "),
         Span::styled(" c/↲ ", Style::default().bg(DIM).fg(Color::Black)),
@@ -877,13 +886,16 @@ fn draw_detail(f: &mut Frame, app: &App) {
         Span::raw(" quick-copy  "),
         Span::styled(" ↑/↓ ", Style::default().bg(DIM).fg(Color::Black)),
         Span::raw(" scroll  "),
-        Span::styled(" s ", Style::default().bg(DIM).fg(Color::Black)),
-        Span::raw(" reveal  "),
-        Span::styled(" e ", Style::default().bg(DIM).fg(Color::Black)),
-        Span::raw(" edit  "),
-        Span::styled(" Esc ", Style::default().bg(DIM).fg(Color::Black)),
-        Span::raw(" back"),
-    ]));
+    ];
+    if !is_basic {
+        hint_spans.push(Span::styled(" s ", Style::default().bg(DIM).fg(Color::Black)));
+        hint_spans.push(Span::raw(" reveal  "));
+        hint_spans.push(Span::styled(" e ", Style::default().bg(DIM).fg(Color::Black)));
+        hint_spans.push(Span::raw(" edit  "));
+    }
+    hint_spans.push(Span::styled(" Esc ", Style::default().bg(DIM).fg(Color::Black)));
+    hint_spans.push(Span::raw(" back"));
+    lines.push(Line::from(hint_spans));
 
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         " Credential detail ",
@@ -963,9 +975,9 @@ fn draw_reveal_prompt(f: &mut Frame, app: &App) {
     };
 
     let (title, prompt) = if app.pending_edit {
-        (" Confirm edit ", "  Editing requires master password")
+        (" Confirm edit ", "  Editing requires vault password")
     } else {
-        (" Confirm reveal ", "  Reveal secret requires master password")
+        (" Confirm reveal ", "  Reveal secret requires vault password")
     };
 
     let lines = vec![
@@ -987,6 +999,68 @@ fn draw_reveal_prompt(f: &mut Frame, app: &App) {
 
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         title,
+        Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+    ));
+    let para = Paragraph::new(lines).block(block);
+    f.render_widget(para, rect);
+
+    // Place cursor at the highlighted position.
+    let cx = rect.x + 1 + label_len + cursor_x;
+    let cy = rect.y + 4;
+    f.set_cursor_position((cx, cy));
+}
+
+fn draw_permission_prompt(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let rect = centered_rect(area, 50, 30);
+    f.render_widget(Clear, rect);
+
+    // Masked password: one bullet per character, split at cursor.
+    let label = "  Password: ";
+    let label_len = label.len() as u16;
+    let avail = rect.width.saturating_sub(2 + label_len);
+    let (visible, cursor_x) = scroll_to_cursor(&app.reveal_password, app.reveal_cursor, avail);
+    let visible_len = visible.chars().count();
+    let cx = cursor_x as usize;
+    let val_style = Style::default().fg(Color::White);
+    let cursor_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+    let pw_line = if cx < visible_len {
+        let before: String = "•".repeat(cx);
+        let after: String = "•".repeat(visible_len - cx - 1);
+        Line::from(vec![
+            Span::styled(label, Style::default().fg(NORMAL)),
+            Span::styled(before, val_style),
+            Span::styled("•", cursor_style),
+            Span::styled(after, val_style),
+        ])
+    } else {
+        let before: String = "•".repeat(visible_len);
+        Line::from(vec![
+            Span::styled(label, Style::default().fg(NORMAL)),
+            Span::styled(before, val_style),
+            Span::styled(" ", cursor_style),
+        ])
+    };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  This operation requires the vault password.",
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        pw_line,
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Enter ", Style::default().bg(DIM).fg(Color::Black)),
+            Span::raw(" confirm  "),
+            Span::styled(" Esc ", Style::default().bg(DIM).fg(Color::Black)),
+            Span::raw(" cancel"),
+        ]),
+    ];
+
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " Master Password Required ",
         Style::default().fg(WARN).add_modifier(Modifier::BOLD),
     ));
     let para = Paragraph::new(lines).block(block);
@@ -1047,7 +1121,7 @@ fn draw_settings(f: &mut Frame, app: &App) {
     f.render_widget(Clear, rect);
 
     // Tab bar.
-    let tabs = [("Password", SettingsTab::Password), ("Tokens", SettingsTab::Tokens), ("Info", SettingsTab::Info)];
+    let tabs = [("Password", SettingsTab::Password), ("Tokens", SettingsTab::Tokens), ("Info", SettingsTab::Info), ("Backup", SettingsTab::Backup)];
     let tab_line = Line::from(
         tabs.iter()
             .map(|(label, tab)| {
@@ -1082,6 +1156,7 @@ fn draw_settings(f: &mut Frame, app: &App) {
         SettingsTab::Password => draw_settings_password(f, app, content_inner),
         SettingsTab::Tokens => draw_settings_tokens(f, app, content_inner),
         SettingsTab::Info => draw_settings_info(f, app, content_inner),
+        SettingsTab::Backup => draw_settings_backup(f, app, content_inner),
     }
 }
 
@@ -1303,6 +1378,109 @@ fn draw_settings_info(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(DIM),
         )),
     ];
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn draw_settings_backup(f: &mut Frame, app: &App, area: Rect) {
+    let perm_full = app.vault.permission().is_full();
+    let cred_count = app.all.len();
+
+    let export_focused = app.settings_backup_field == 0;
+    let import_focused = app.settings_backup_field == 1;
+
+    // Detect format from export path.
+    let export_path = PathBuf::from(&app.settings_backup_export_path);
+    let fmt_hint = transfer::detect_format(&export_path).unwrap_or("json");
+
+    let no_reveal_sym = if app.settings_backup_no_reveal { "[x]" } else { "[ ]" };
+    let overwrite_sym = if app.settings_backup_overwrite { "[x]" } else { "[ ]" };
+
+    let export_path_display = if export_focused {
+        // Show cursor.
+        let chars: Vec<char> = app.settings_backup_export_path.chars().collect();
+        let cursor = app.settings_backup_export_cursor.min(chars.len());
+        let before: String = chars[..cursor].iter().collect();
+        let after: String = chars[cursor..].iter().collect();
+        format!("{}│{}", before, after)
+    } else {
+        app.settings_backup_export_path.clone()
+    };
+
+    let import_path_display = if import_focused {
+        let chars: Vec<char> = app.settings_backup_import_path.chars().collect();
+        let cursor = app.settings_backup_import_cursor.min(chars.len());
+        let before: String = chars[..cursor].iter().collect();
+        let after: String = chars[cursor..].iter().collect();
+        format!("{}│{}", before, after)
+    } else {
+        app.settings_backup_import_path.clone()
+    };
+
+    let export_label_style = if export_focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(NORMAL)
+    };
+    let import_label_style = if import_focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(NORMAL)
+    };
+
+    let lines = vec![
+        Line::from(""),
+        // Export section
+        Line::from(Span::styled(
+            "── Export ──",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Path: ", export_label_style),
+            Span::styled(export_path_display, if export_focused { export_label_style } else { Style::default().fg(NORMAL) }),
+        ]),
+        Line::from(vec![
+            Span::styled("  Format: ", Style::default().fg(DIM)),
+            Span::styled(fmt_hint, Style::default().fg(DIM)),
+            Span::styled(" (auto-detected from extension)", Style::default().fg(DIM)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("  {} ", no_reveal_sym), if export_focused { export_label_style } else { Style::default().fg(NORMAL) }),
+            Span::styled("Metadata only (no secrets)", Style::default().fg(NORMAL)),
+        ]),
+        Line::from(""),
+        // Import section
+        Line::from(Span::styled(
+            "── Import ──",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Path: ", import_label_style),
+            Span::styled(import_path_display, if import_focused { import_label_style } else { Style::default().fg(NORMAL) }),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("  {} ", overwrite_sym), if import_focused { import_label_style } else { Style::default().fg(NORMAL) }),
+            Span::styled("Overwrite existing credentials", Style::default().fg(NORMAL)),
+        ]),
+        Line::from(""),
+        Line::from(""),
+        // Hints
+        Line::from(vec![
+            Span::styled("↑/↓", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::raw(": switch section  "),
+            Span::styled("Space", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::raw(": toggle  "),
+            Span::styled("Enter", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::raw(": execute"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {} credentials in vault · {} permission", cred_count, if perm_full { "Full" } else { "Basic" }),
+            Style::default().fg(DIM),
+        )),
+    ];
+
     f.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 

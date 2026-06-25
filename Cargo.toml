@@ -1,6 +1,6 @@
 [package]
 name = "devcred"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "DevCred - A local credential manager for developers with a TUI interface"
 license = "MIT"
@@ -52,6 +52,10 @@ fuzzy-matcher = "0.3"
 
 # Password input (no echo)
 rpassword = "7"
+
+# Import/export
+csv = "1"
+rust_xlsxwriter = "0.79"
 
 [profile.release]
 opt-level = 3

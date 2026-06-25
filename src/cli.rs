@@ -5,7 +5,7 @@
 
 use crate::credential;
 use crate::db::{self, Vault};
-use crate::{clipboard, injector};
+use crate::{clipboard, injector, transfer};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -143,6 +143,49 @@ pub enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// Export credentials to a file (JSON, CSV, or XLSX).
+    ///
+    /// By default, secrets are included and require re-entering the master
+    /// password. Use --no-reveal to export metadata only.
+    Export {
+        /// Output format: json, csv, xlsx, or comma-separated combo (e.g. json,csv).
+        /// Auto-detected from --out extension if omitted.
+        /// Use --all for all formats.
+        #[arg(long)]
+        format: Option<String>,
+        /// Output file path (base name for multi-format export).
+        /// Prints to stdout if omitted (JSON/CSV only, single format).
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Export without secrets (metadata only).
+        #[arg(long = "no-reveal")]
+        no_reveal: bool,
+        /// Export all formats (json + csv + xlsx). Requires --out.
+        #[arg(long)]
+        all: bool,
+        /// Filter by environment.
+        #[arg(long)]
+        env: Option<String>,
+        /// Filter by project.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Import credentials from a file (JSON, CSV, or TXT).
+    Import {
+        /// Input file path.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Input format: json, csv, or txt.
+        /// Auto-detected from file extension if omitted.
+        #[arg(long)]
+        format: Option<String>,
+        /// Preview without writing to the vault.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Overwrite existing credentials with the same name (default: skip).
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// Launch the TUI (default when no subcommand is given).
     Tui,
 }
@@ -209,6 +252,20 @@ pub fn run(cli: Cli) -> Result<()> {
             let code = injector::run(&vault, env.as_deref(), &only, cmd, rest, !no_redact)?;
             std::process::exit(code);
         }
+        Some(Command::Export {
+            format,
+            out,
+            no_reveal,
+            all,
+            env,
+            project,
+        }) => export_credentials(&vault_path, format, out, no_reveal, all, env, project),
+        Some(Command::Import {
+            file,
+            format,
+            dry_run,
+            overwrite,
+        }) => import_credentials(&vault_path, file, format, dry_run, overwrite),
     }
 }
 
@@ -219,12 +276,12 @@ fn prompt_password(confirm: bool) -> Result<String> {
             return Ok(pw);
         }
     }
-    let pw = rpassword::prompt_password("Master password: ")?;
+    let pw = rpassword::prompt_password("Vault password: ")?;
     if pw.is_empty() {
-        bail!("master password cannot be empty");
+        bail!("vault password cannot be empty");
     }
     if confirm {
-        let pw2 = rpassword::prompt_password("Confirm master password: ")?;
+        let pw2 = rpassword::prompt_password("Confirm vault password: ")?;
         if pw != pw2 {
             bail!("passwords do not match");
         }
@@ -405,9 +462,9 @@ fn list_credentials(
         }
         // Re-confirm master password before dumping plaintext secrets.
         eprintln!("WARNING: revealing secrets in plaintext.");
-        let confirm = rpassword::prompt_password("Re-enter master password to confirm: ")?;
+        let confirm = rpassword::prompt_password("Re-enter vault password to confirm: ")?;
         if !vault.verify_password(&confirm) {
-            bail!("master password mismatch — revealing secrets refused");
+            bail!("vault password mismatch — revealing secrets refused");
         }
     }
     let records = vault.list(env.as_deref(), project.as_deref())?;
@@ -459,6 +516,9 @@ fn copy_credential(path: &PathBuf, query: &str, clear_after: u64) -> Result<()> 
 
 fn show_credential(path: &PathBuf, query: &str, full: bool) -> Result<()> {
     let vault = open_vault(path)?;
+    if !vault.permission().is_full() {
+        bail!("permission denied: `show` requires the master password to view secrets");
+    }
     // Try exact lookup first (by id or name), then fall back to fuzzy search.
     let rec = match lookup(&vault, query)? {
         Some(r) => r,
@@ -472,21 +532,12 @@ fn show_credential(path: &PathBuf, query: &str, full: bool) -> Result<()> {
         }
     };
     let dec = vault.decrypt(&rec)?;
-    let is_full = vault.permission().is_full();
-
-    if full && !is_full {
-        bail!("permission denied: --full requires the master password");
-    }
 
     if !full {
         // Pipe-friendly mode: secret to stdout, custom fields to stderr.
-        // In basic mode, masked custom fields are omitted entirely.
         if !dec.custom_fields.is_empty() {
             eprintln!("Custom fields for `{}`:", dec.name);
             for cf in &dec.custom_fields {
-                if cf.masked && !is_full {
-                    continue; // Hide masked fields in basic mode.
-                }
                 let val = if cf.masked {
                     "•".repeat(cf.value.chars().count().min(16))
                 } else {
@@ -733,4 +784,239 @@ fn truncate(s: &str, n: usize) -> String {
 
 fn mask_or_reveal(s: &str) -> String {
     s.to_string()
+}
+
+// ── Export handler ──────────────────────────────────────────────
+
+fn export_credentials(
+    path: &PathBuf,
+    format: Option<String>,
+    out: Option<PathBuf>,
+    no_reveal: bool,
+    all: bool,
+    env: Option<String>,
+    project: Option<String>,
+) -> Result<()> {
+    let vault = open_vault(path)?;
+
+    // If revealing secrets, require Full permission + re-confirm password.
+    if !no_reveal {
+        if !vault.permission().is_full() {
+            bail!("permission denied: exporting secrets requires the master password");
+        }
+        eprintln!("WARNING: exporting plaintext secrets.");
+        let confirm = prompt_password(false)?;
+        if !vault.verify_password(&confirm) {
+            bail!("vault password mismatch — export refused");
+        }
+    }
+
+    // Determine formats: --all > comma-separated --format > auto-detect > default json.
+    let formats: Vec<String> = if all {
+        vec!["json".into(), "csv".into(), "xlsx".into()]
+    } else {
+        match &format {
+            Some(f) if f.contains(',') => {
+                f.split(',').map(|s| s.trim().to_lowercase()).collect()
+            }
+            Some(f) => vec![f.to_lowercase()],
+            None => {
+                let detected = out.as_ref().and_then(|p| transfer::detect_format(p));
+                vec![detected.unwrap_or("json").to_string()]
+            }
+        }
+    };
+
+    // Validate all formats.
+    for f in &formats {
+        if !["json", "csv", "xlsx"].contains(&f.as_str()) {
+            bail!("unsupported format: {} (use json, csv, or xlsx)", f);
+        }
+    }
+
+    let multi = formats.len() > 1;
+
+    // Multi-format and XLSX require --out.
+    if multi && out.is_none() {
+        bail!("multiple formats require --out <base-name> (extensions are added automatically)");
+    }
+    if formats.iter().any(|f| f == "xlsx") && out.is_none() {
+        bail!("XLSX export requires --out <file>");
+    }
+
+    // List and decrypt credentials.
+    let records = vault.list(env.as_deref(), project.as_deref())?;
+    if records.is_empty() {
+        eprintln!("(no credentials to export)");
+        return Ok(());
+    }
+
+    let mut decrypted = Vec::with_capacity(records.len());
+    for rec in &records {
+        let d = vault.decrypt(rec)?;
+        decrypted.push(d);
+    }
+
+    eprintln!(
+        "Exporting {} credential(s) as {}.",
+        decrypted.len(),
+        formats.join(", ")
+    );
+
+    // Generate output for each format.
+    for fmt in &formats {
+        let out_path = out.as_ref().map(|p| {
+            if multi {
+                p.with_extension(fmt)
+            } else {
+                p.clone()
+            }
+        });
+        match fmt.as_str() {
+            "json" => {
+                let json = transfer::export_json(&decrypted, no_reveal)?;
+                if let Some(ref out_path) = out_path {
+                    std::fs::write(out_path, &json)
+                        .with_context(|| format!("writing to {}", out_path.display()))?;
+                    eprintln!("Written to {}", out_path.display());
+                } else {
+                    println!("{}", json);
+                }
+            }
+            "csv" => {
+                let csv = transfer::export_csv(&decrypted, no_reveal)?;
+                if let Some(ref out_path) = out_path {
+                    std::fs::write(out_path, &csv)
+                        .with_context(|| format!("writing to {}", out_path.display()))?;
+                    eprintln!("Written to {}", out_path.display());
+                } else {
+                    println!("{}", csv);
+                }
+            }
+            "xlsx" => {
+                let out_path = out_path.expect("xlsx requires --out");
+                transfer::export_xlsx(&decrypted, no_reveal, &out_path)?;
+                eprintln!("Written to {}", out_path.display());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    if !no_reveal {
+        eprintln!("WARNING: the exported file(s) contain plaintext secrets. Store them securely.");
+    }
+    Ok(())
+}
+
+// ── Import handler ──────────────────────────────────────────────
+
+fn import_credentials(
+    path: &PathBuf,
+    file: PathBuf,
+    format: Option<String>,
+    dry_run: bool,
+    overwrite: bool,
+) -> Result<()> {
+    let vault = open_vault(path)?;
+
+    if !vault.permission().is_full() {
+        bail!("permission denied: importing requires the master password");
+    }
+
+    // Read input file.
+    let content = std::fs::read_to_string(&file)
+        .with_context(|| format!("reading {}", file.display()))?;
+
+    // Determine format.
+    let fmt = format
+        .as_deref()
+        .or_else(|| transfer::detect_format(&file))
+        .ok_or_else(|| anyhow::anyhow!(
+            "could not detect format from file extension; use --format json|csv|txt"
+        ))?;
+
+    // Parse entries.
+    let entries = match fmt {
+        "json" => transfer::parse_json(&content)?,
+        "csv" => transfer::parse_csv(&content)?,
+        "txt" => transfer::parse_txt(&content)?,
+        _ => bail!("unsupported import format: {} (use json, csv, or txt)", fmt),
+    };
+
+    if entries.is_empty() {
+        eprintln!("(no entries to import)");
+        return Ok(());
+    }
+
+    eprintln!("Parsed {} entr(y/ies) from {} ({} format).", entries.len(), file.display(), fmt);
+    if dry_run {
+        eprintln!("Dry run — no changes will be written to the vault.");
+    }
+
+    let mut stats = transfer::ImportStats {
+        total: entries.len(),
+        imported: 0,
+        skipped: 0,
+        errors: 0,
+    };
+
+    for entry in &entries {
+        // Check for duplicate name.
+        if let Some(existing) = vault.find_by_name(&entry.name)? {
+            if !overwrite {
+                eprintln!("  SKIP: \"{}\" — already exists (use --overwrite to replace)", entry.name);
+                stats.skipped += 1;
+                continue;
+            }
+            // Delete existing credential before re-adding.
+            vault.delete(existing.id)?;
+            eprintln!("  OVERWRITE: \"{}\" — deleted existing entry", entry.name);
+        }
+
+        if dry_run {
+            eprintln!("  PREVIEW: \"{}\" (kind={}, env={})", entry.name, entry.kind,
+                entry.env.as_deref().unwrap_or(""));
+            stats.imported += 1;
+            continue;
+        }
+
+        // Determine kind.
+        let kind = if entry.kind.is_empty() {
+            let detection = credential::detect(&entry.secret);
+            detection.kind
+        } else {
+            db::parse_kind(&entry.kind)
+        };
+
+        // Add the credential.
+        match vault.add(
+            &entry.name,
+            kind,
+            entry.env.as_deref().unwrap_or(""),
+            entry.project.as_deref().unwrap_or(""),
+            &entry.secret,
+            entry.env_var.as_deref().unwrap_or(""),
+            entry.notes.as_deref().unwrap_or(""),
+        ) {
+            Ok(id) => {
+                // Add custom fields if any.
+                if !entry.custom_fields.is_empty() {
+                    let fields: Vec<(String, String, bool)> = entry.custom_fields.iter()
+                        .map(|f| (f.key.clone(), f.value.clone(), f.masked))
+                        .collect();
+                    vault.set_custom_fields(id, &fields)?;
+                }
+                eprintln!("  IMPORTED: \"{}\" (id={})", entry.name, id);
+                stats.imported += 1;
+            }
+            Err(e) => {
+                eprintln!("  ERROR: \"{}\" — {}", entry.name, e);
+                stats.errors += 1;
+            }
+        }
+    }
+
+    eprintln!();
+    eprintln!("{}", stats);
+    Ok(())
 }

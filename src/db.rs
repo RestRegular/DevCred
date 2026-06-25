@@ -55,7 +55,7 @@ pub struct CredentialRecord {
 }
 
 /// A decrypted credential, ready to copy or inject.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DecryptedCredential {
     pub id: i64,
     pub name: String,
@@ -72,7 +72,7 @@ pub struct DecryptedCredential {
 }
 
 /// A user-defined field attached to a credential.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CustomField {
     pub key: String,
     /// Decrypted value.
@@ -514,6 +514,28 @@ impl Vault {
         }
     }
 
+    /// Upgrade the session from Basic to Full permission by verifying the
+    /// master password. Used by the TUI when a basic-mode user attempts a
+    /// restricted action — a popup collects the master password, and if
+    /// verification succeeds, the session is elevated in-place.
+    pub fn upgrade_to_full(&mut self, password: &str) -> Result<()> {
+        let salt: Vec<u8> = self.conn.query_row(
+            "SELECT value FROM meta WHERE key = 'salt'",
+            [],
+            |r| r.get(0),
+        )?;
+        let key = MasterKey::derive(password, &salt)?;
+        let probe: Vec<u8> = self.conn.query_row(
+            "SELECT value FROM meta WHERE key = 'probe'",
+            [],
+            |r| r.get(0),
+        )?;
+        key.open(&probe)?; // AES-GCM tag verification — fails on wrong password.
+        self.key = key;
+        self.permission = Permission::Full;
+        Ok(())
+    }
+
     /// Returns the permission level of the current session.
     pub fn permission(&self) -> Permission {
         self.permission
@@ -742,7 +764,7 @@ fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn kind_label(k: &CredentialKind) -> String {
+pub fn kind_label(k: &CredentialKind) -> String {
     match k {
         CredentialKind::Github => "github".to_string(),
         CredentialKind::Pypi => "pypi".to_string(),
